@@ -15,7 +15,7 @@ tasks:
   dev:
     desc: "Run with hot reload"
     cmds:
-      - uv run uvicorn src.prediction_engine.main:app --reload --port 8004
+      - uv run uvicorn --app-dir src prediction_engine.main:app --reload --port 8004
 
   lint:
     desc: "Run linters"
@@ -32,3 +32,25 @@ tasks:
     desc: "Run type checker"
     cmds:
       - uv run mypy src/
+
+  db:migrate:
+    desc: "Apply Alembic migrations to the predictions schema"
+    cmds:
+      - uv run alembic upgrade head
+
+  train:
+    desc: "Train the synthetic bootstrap model into ./models"
+    cmds:
+      - uv run python scripts/train.py --synthetic --out ./models
+
+  spec:export:
+    desc: "Export the generated OpenAPI spec to the docs repo (ADR-021)"
+    cmds:
+      - uv run python scripts/export_openapi.py --out
+        ../bookie-breaker-docs/api-contracts/openapi/prediction-engine.yaml
+
+  spec:check:
+    desc: "Verify the committed OpenAPI artifact matches the served spec"
+    cmds:
+      - uv run python scripts/export_openapi.py | diff -
+        ../bookie-breaker-docs/api-contracts/openapi/prediction-engine.yaml
