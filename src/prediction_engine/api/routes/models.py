@@ -4,7 +4,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Path, Query
 
 from prediction_engine.api.dependencies import get_model_repo
 from prediction_engine.api.envelope import Envelope, envelope
@@ -40,10 +40,11 @@ def _to_data(record: ModelVersionRecord) -> ModelVersionData:
 @router.get("/models", response_model=Envelope[list[ModelVersionData]])
 async def list_models(
     repo: RepoDep,
-    sport: Annotated[str | None, Query()] = None,
-    market_type: Annotated[str | None, Query()] = None,
-    is_active: Annotated[bool | None, Query()] = None,
+    sport: Annotated[str | None, Query(description="Filter by sport (e.g. BASKETBALL).")] = None,
+    market_type: Annotated[str | None, Query(description="Filter by market type.")] = None,
+    is_active: Annotated[bool | None, Query(description="Filter by active status.")] = None,
 ) -> Envelope[list[ModelVersionData]]:
+    """List model versions, newest first."""
     records = await repo.list_models(
         sport=sport.upper() if sport else None,
         market_type=market_type.upper() if market_type else None,
@@ -53,7 +54,10 @@ async def list_models(
 
 
 @router.get("/models/{model_id}", response_model=Envelope[ModelVersionDetailData])
-async def get_model(model_id: uuid.UUID, repo: RepoDep) -> Envelope[ModelVersionDetailData]:
+async def get_model(
+    model_id: Annotated[uuid.UUID, Path(description="The model version identifier.")], repo: RepoDep
+) -> Envelope[ModelVersionDetailData]:
+    """Get a model version including its ordered feature names."""
     record = await repo.get(model_id)
     if record is None:
         raise NotFoundError(f"Model version {model_id} not found")

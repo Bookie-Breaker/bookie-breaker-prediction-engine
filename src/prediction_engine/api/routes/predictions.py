@@ -3,7 +3,7 @@
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, Query
+from fastapi import APIRouter, Depends, Header, Path, Query
 
 from prediction_engine.api.dependencies import get_prediction_repo, get_predictor
 from prediction_engine.api.envelope import Envelope, envelope
@@ -28,13 +28,19 @@ RepoDep = Annotated[PredictionRepository, Depends(get_prediction_repo)]
 async def create_predictions(
     request: PredictionRequest,
     predictor: PredictorDep,
-    x_idempotency_key: Annotated[str | None, Header()] = None,
+    x_idempotency_key: Annotated[
+        str | None, Header(description="UUID for idempotent submission (replayed for 24 hours).")
+    ] = None,
 ) -> Envelope[PredictionGroupData]:
+    """Generate calibrated predictions for a game across the requested market types."""
     return envelope(await predictor.create_predictions(request, idempotency_key=x_idempotency_key))
 
 
 @router.get("/predictions/{prediction_id}", response_model=Envelope[PredictionDetailData])
-async def get_prediction(prediction_id: uuid.UUID, repo: RepoDep) -> Envelope[PredictionDetailData]:
+async def get_prediction(
+    prediction_id: Annotated[uuid.UUID, Path(description="The prediction identifier.")], repo: RepoDep
+) -> Envelope[PredictionDetailData]:
+    """Get a specific prediction with its full stored feature vector."""
     found = await repo.get(prediction_id)
     if found is None:
         raise NotFoundError(f"Prediction {prediction_id} not found")
@@ -65,11 +71,14 @@ async def get_prediction(prediction_id: uuid.UUID, repo: RepoDep) -> Envelope[Pr
 
 @router.get("/games/{game_id}/latest", response_model=Envelope[LatestPredictionsData])
 async def latest_predictions(
-    game_id: str,
+    game_id: Annotated[str, Path(description="The statistics-service game identifier.")],
     repo: RepoDep,
-    market_type: Annotated[str | None, Query()] = None,
-    model_version: Annotated[uuid.UUID | None, Query()] = None,
+    market_type: Annotated[
+        str | None, Query(description="Filter by market type; comma-separated for multiple.")
+    ] = None,
+    model_version: Annotated[uuid.UUID | None, Query(description="Filter by a specific model version.")] = None,
 ) -> Envelope[LatestPredictionsData]:
+    """Get the most recent prediction per market type for a game."""
     markets = [m.strip().upper() for m in market_type.split(",")] if market_type else None
     records = await repo.latest_for_game(game_id, market_types=markets, model_version_id=model_version)
     if not records:

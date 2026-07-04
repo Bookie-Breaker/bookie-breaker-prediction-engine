@@ -71,6 +71,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         title="BookieBreaker Prediction Engine",
         version=__version__,
         description="ML-calibrated probabilities and confidence intervals over simulation output.",
+        contact={
+            "name": "BookieBreaker",
+            "url": "https://github.com/Bookie-Breaker",
+            "email": "jsamuelsen11@gmail.com",
+        },
+        license_info={"name": "MIT", "url": "https://opensource.org/licenses/MIT"},
+        servers=[{"url": "http://localhost:8004", "description": "Local development"}],
+        openapi_tags=[
+            {"name": "edges", "description": "Predictions combined with current market lines."},
+            {"name": "health", "description": "Service health and active models."},
+            {"name": "models", "description": "Model version registry and retraining."},
+            {"name": "predictions", "description": "Generate and fetch calibrated predictions."},
+        ],
         lifespan=lifespan,
     )
     app.add_middleware(RequestIDMiddleware)
