@@ -56,11 +56,63 @@ NBA_FEATURES: tuple[str, ...] = (
     "line_consensus_std",
 )
 
+# Soccer pools all competitions into one SOCCER model with the competition
+# as a one-hot feature (ADR-026); EPL is the one-hot baseline. The sim block
+# gains sim_draw_probability and moneyline rows gain selection_is_draw
+# because the primary market is three-way (ADR-027). Documented exclusions
+# (no honest data source in the Phase 6 statistics-service soccer block):
+# injuries (no reliable soccer injury feed; always absent, unlike NBA),
+# back-to-backs (soccer never schedules consecutive days — rest_days covers
+# schedule density), home/away splits (FIFA_WC venues are neutral),
+# possession/xG (not in the SoccerStats contract until a richer source
+# lands), head-to-head history, and weather.
+SOCCER_FEATURES: tuple[str, ...] = (
+    # simulation-derived (per-market: sim_probability varies by market type)
+    "sim_probability",
+    "sim_margin_mean",
+    "sim_total_mean",
+    "sim_draw_probability",
+    "sim_converged",
+    # market type one-hot (single unified model, market as feature)
+    "market_is_spread",
+    "market_is_total",
+    "market_is_moneyline",
+    # selection (three-way moneyline rows: HOME/AWAY 0.0, DRAW 1.0)
+    "selection_is_draw",
+    # season strength (SoccerStats block: multiplicative vs competition avg)
+    "home_attack_strength",
+    "home_defense_strength",
+    "away_attack_strength",
+    "away_defense_strength",
+    "home_goals_for_per_match",
+    "home_goals_against_per_match",
+    "away_goals_for_per_match",
+    "away_goals_against_per_match",
+    # recent form and sample size
+    "home_form_points_last5",
+    "away_form_points_last5",
+    "home_matches_played",
+    "away_matches_played",
+    # situational
+    "home_rest_days",
+    "away_rest_days",
+    "is_knockout",
+    # competition one-hot (ADR-026 pooled model; EPL is the baseline)
+    "competition_is_fifa_wc",
+    # market signal
+    "line_movement",
+    "n_books_reporting",
+    "line_consensus_std",
+)
+
 FeatureMap = dict[str, float | None]
 
 # Sport -> ordered feature tuple. New sports register here in their league
 # wave (ADR-026); until then get_features fails loudly for them.
-FEATURES_BY_SPORT: dict[str, tuple[str, ...]] = {"BASKETBALL": NBA_FEATURES}
+FEATURES_BY_SPORT: dict[str, tuple[str, ...]] = {
+    "BASKETBALL": NBA_FEATURES,
+    "SOCCER": SOCCER_FEATURES,
+}
 
 
 def get_features(sport: str) -> tuple[str, ...]:
