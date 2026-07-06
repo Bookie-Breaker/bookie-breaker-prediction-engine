@@ -25,6 +25,7 @@ class Game(BaseModel):
     away_team: TeamRef
     scheduled_start: str = ""
     season: int = 0
+    season_type: str = ""
 
 
 class OffensiveStats(BaseModel):
@@ -57,12 +58,32 @@ class AdvancedStats(BaseModel):
     offensive_rebound_pct: float = 0.0
 
 
+class SoccerStats(BaseModel):
+    """Soccer-specific block (SOCCER-sport leagues only; ADR-026).
+
+    Strengths are multiplicative factors relative to the competition
+    average (1.0 = average), shrunk toward 1.0 by matches played.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    goals_for_per_match: float = 0.0
+    goals_against_per_match: float = 0.0
+    attack_strength: float = 0.0
+    defense_strength: float = 0.0
+    draws: int = 0
+    form_goals_for_last5: float = 0.0
+    form_goals_against_last5: float = 0.0
+    form_points_last5: int = 0
+
+
 class StatBlocks(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     offensive: OffensiveStats = OffensiveStats()
     defensive: DefensiveStats = DefensiveStats()
     advanced: AdvancedStats = AdvancedStats()
+    soccer: SoccerStats | None = None
 
 
 class HomeAwaySplit(BaseModel):

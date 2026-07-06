@@ -222,6 +222,11 @@ class Predictor:
                 features["market_is_spread"] = 1.0 if market == "SPREAD" else 0.0
                 features["market_is_total"] = 1.0 if market == "TOTAL" else 0.0
                 features["market_is_moneyline"] = 1.0 if market == "MONEYLINE" else 0.0
+                # Three-way features (ADR-027): ignored by sports whose
+                # registries do not include them (vectorization is
+                # registry-ordered), so two-way sports are unaffected.
+                features["sim_draw_probability"] = run.result.draw_probability
+                features["selection_is_draw"] = 1.0 if inputs.side == "DRAW" else 0.0
 
                 adjustment = loaded.bundle.model.predict_adjustment(features)
                 raw = float(np.clip(inputs.sim_probability + adjustment, 0.01, 0.99))

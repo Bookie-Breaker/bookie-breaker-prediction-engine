@@ -18,6 +18,7 @@ from prediction_engine.core.features.injuries import MAX_PLAYERS_CONSIDERED, inj
 from prediction_engine.core.features.market import market_features
 from prediction_engine.core.features.registry import FeatureMap
 from prediction_engine.core.features.situational import rest_features
+from prediction_engine.core.leagues import LEAGUE_TO_SPORT
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,30 @@ class FeatureBuilder:
         features.update(rest_features(game_date, recent_games, prefix))
         return features
 
+    async def _soccer_team_features(self, team_id: str, prefix: str, game_date: date) -> FeatureMap:
+        """Team features from the SoccerStats block (ADR-026).
+
+        No injuries for soccer: the statistics-service has no soccer injury
+        feed, so the registry excludes injury features entirely rather than
+        emitting always-null columns. Back-to-backs never occur in soccer
+        scheduling, so only rest_days is kept from the rest block.
+        """
+        season, recent_games = await asyncio.gather(
+            self._statistics.get_team_stats(team_id),
+            self._statistics.list_recent_games(team_id, date_to=game_date.isoformat()),
+        )
+        soccer = season.stats.soccer
+        features: FeatureMap = {
+            f"{prefix}_attack_strength": (soccer.attack_strength or None) if soccer else None,
+            f"{prefix}_defense_strength": (soccer.defense_strength or None) if soccer else None,
+            f"{prefix}_goals_for_per_match": soccer.goals_for_per_match if soccer else None,
+            f"{prefix}_goals_against_per_match": soccer.goals_against_per_match if soccer else None,
+            f"{prefix}_form_points_last5": float(soccer.form_points_last5) if soccer else None,
+            f"{prefix}_matches_played": float(season.games_played) if season.games_played else None,
+        }
+        features[f"{prefix}_rest_days"] = rest_features(game_date, recent_games, prefix)[f"{prefix}_rest_days"]
+        return features
+
     async def _market_block(self, game: Game) -> tuple[FeatureMap, str | None]:
         lines_id = await self._reconciler.resolve(game)
         empty: FeatureMap = {"line_movement": None, "n_books_reporting": None, "line_consensus_std": None}
@@ -96,8 +121,18 @@ class FeatureBuilder:
             return empty, lines_id
         return market_features(movements, spread_lines), lines_id
 
-    async def build(self, game: Game) -> FeatureBundle:
-        game_date = _game_date(game)
+    async def _build_soccer(self, game: Game, game_date: date) -> tuple[FeatureMap, str | None]:
+        home, away, (market_block, lines_id) = await asyncio.gather(
+            self._soccer_team_features(game.home_team.id, "home", game_date),
+            self._soccer_team_features(game.away_team.id, "away", game_date),
+            self._market_block(game),
+        )
+        features: FeatureMap = {**home, **away, **market_block}
+        features["is_knockout"] = 1.0 if game.season_type == "POSTSEASON" else 0.0
+        features["competition_is_fifa_wc"] = 1.0 if game.league == "FIFA_WC" else 0.0
+        return features, lines_id
+
+    async def _build_basketball(self, game: Game, game_date: date) -> tuple[FeatureMap, str | None]:
         home, away, (market_block, lines_id) = await asyncio.gather(
             self._team_features(game.home_team.id, "home", game_date, game.league),
             self._team_features(game.away_team.id, "away", game_date, game.league),
@@ -114,6 +149,14 @@ class FeatureBuilder:
         features["net_rating_diff"] = diff("home_net_rating", "away_net_rating")
         features["rest_advantage"] = diff("home_rest_days", "away_rest_days")
         features["injury_impact_diff"] = diff("home_injury_impact", "away_injury_impact")
+        return features, lines_id
+
+    async def build(self, game: Game) -> FeatureBundle:
+        game_date = _game_date(game)
+        if LEAGUE_TO_SPORT.get(game.league) == "SOCCER":
+            features, lines_id = await self._build_soccer(game, game_date)
+        else:
+            features, lines_id = await self._build_basketball(game, game_date)
 
         stats_ts = await self._statistics.get_meta_timestamp("/api/v1/stats/health")
         sources: dict[str, str | None] = {

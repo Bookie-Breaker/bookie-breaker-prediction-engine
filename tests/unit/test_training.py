@@ -1,11 +1,11 @@
-"""Trainer smoke tests on the seeded synthetic dataset (fast rounds)."""
+"""Trainer smoke tests on the seeded synthetic datasets (fast rounds)."""
 
 import numpy as np
 import pytest
 
-from prediction_engine.core.features.registry import NBA_FEATURES
+from prediction_engine.core.features.registry import NBA_FEATURES, SOCCER_FEATURES
 from prediction_engine.core.model.artifact import ArtifactBundle, find_latest_artifact
-from prediction_engine.core.training.synthetic import generate_synthetic_dataset
+from prediction_engine.core.training.synthetic import generate_soccer_synthetic_dataset, generate_synthetic_dataset
 from prediction_engine.core.training.train import save_artifact, train_model
 
 
@@ -69,3 +69,89 @@ class TestTraining:
         assert len(strong) > 20
         adjustments = [training_result.bundle.model.predict_adjustment(f) for f, _ in strong]
         assert float(np.mean(adjustments)) > 0.005
+
+
+@pytest.fixture(scope="module")
+def soccer_dataset():
+    return generate_soccer_synthetic_dataset(n_games=1200)
+
+
+@pytest.fixture(scope="module")
+def soccer_training_result(soccer_dataset):
+    return train_model(soccer_dataset, n_rounds=150, data_label="synthetic", sport="SOCCER")
+
+
+class TestSoccerSyntheticDataset:
+    def test_deterministic_and_five_rows_per_game(self, soccer_dataset) -> None:
+        again = generate_soccer_synthetic_dataset(n_games=1200)
+        assert len(soccer_dataset) == 1200 * 5
+        assert np.array_equal(soccer_dataset.sim_probs, again.sim_probs)
+        assert np.array_equal(soccer_dataset.outcomes, again.outcomes)
+        assert soccer_dataset.features[0] == again.features[0]
+
+    def test_moneyline_triples_are_exhaustive_and_exclusive(self, soccer_dataset) -> None:
+        for game_start in range(0, 50 * 5, 5):
+            triple = soccer_dataset.features[game_start : game_start + 3]
+            assert [row["market_is_moneyline"] for row in triple] == [1.0, 1.0, 1.0]
+            assert [row["selection_is_draw"] for row in triple] == [0.0, 1.0, 0.0]
+            # exactly one of HOME/DRAW/AWAY wins
+            assert soccer_dataset.outcomes[game_start : game_start + 3].sum() == 1.0
+            sim_triple = soccer_dataset.sim_probs[game_start : game_start + 3]
+            assert sim_triple.sum() == pytest.approx(1.0, abs=1e-9)
+
+    def test_draw_rate_realistic_and_decreasing_with_strength_gap(self, soccer_dataset) -> None:
+        draw_rows = [
+            (features, sim, outcome)
+            for features, sim, outcome in zip(
+                soccer_dataset.features, soccer_dataset.sim_probs, soccer_dataset.outcomes, strict=True
+            )
+            if features["selection_is_draw"] == 1.0
+        ]
+        draw_sims = np.array([sim for _, sim, _ in draw_rows])
+        draw_outcomes = np.array([outcome for _, _, outcome in draw_rows])
+        assert 0.20 <= float(draw_outcomes.mean()) <= 0.30
+        assert 0.15 <= float(np.median(draw_sims)) <= 0.30
+
+        gaps = np.array(
+            [abs((f["home_attack_strength"] or 1) - (f["away_attack_strength"] or 1)) for f, _, _ in draw_rows]
+        )
+        small_gap = draw_sims[gaps < np.median(gaps)]
+        large_gap = draw_sims[gaps >= np.median(gaps)]
+        assert small_gap.mean() > large_gap.mean()
+
+    def test_knockout_draw_bump_is_embedded(self) -> None:
+        dataset = generate_soccer_synthetic_dataset(n_games=4000, seed=3)
+        knockout_draws, open_draws = [], []
+        for features, outcome in zip(dataset.features, dataset.outcomes, strict=True):
+            if features["selection_is_draw"] != 1.0:
+                continue
+            (knockout_draws if features["is_knockout"] == 1.0 else open_draws).append(outcome)
+        assert np.mean(knockout_draws) > np.mean(open_draws)
+
+    def test_rows_cover_all_three_markets_on_goal_lines(self, soccer_dataset) -> None:
+        spread = soccer_dataset.features[3]
+        total = soccer_dataset.features[4]
+        assert spread["market_is_spread"] == 1.0 and spread["market_is_moneyline"] == 0.0
+        assert total["market_is_total"] == 1.0 and total["market_is_spread"] == 0.0
+        totals = [f["sim_total_mean"] for f in soccer_dataset.features[:500]]
+        assert 1.5 < float(np.mean(totals)) < 4.0  # goals, not points
+
+
+class TestSoccerTraining:
+    def test_trains_end_to_end_and_beats_simulation_baseline(self, soccer_training_result) -> None:
+        metrics = soccer_training_result.metrics
+        assert metrics["brier_score"] < metrics["brier_score_simulation_baseline"]
+        assert soccer_training_result.training_samples > 0
+
+    def test_metadata_is_soccer_tagged(self, soccer_training_result) -> None:
+        metadata = soccer_training_result.bundle.metadata
+        assert metadata["feature_names"] == list(SOCCER_FEATURES)
+        assert metadata["version_tag"].startswith("SOCCER_unified_")
+        assert metadata["sport"] == "SOCCER"
+
+    def test_artifact_saves_under_soccer_path(self, soccer_training_result, tmp_path) -> None:
+        artifact_dir = save_artifact(soccer_training_result, tmp_path)
+        assert artifact_dir.parent == tmp_path / "soccer" / "unified"
+        assert find_latest_artifact(tmp_path, "soccer") == artifact_dir
+        loaded = ArtifactBundle.load(artifact_dir)
+        assert loaded.feature_names == list(SOCCER_FEATURES)
