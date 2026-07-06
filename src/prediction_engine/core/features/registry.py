@@ -1,11 +1,12 @@
-"""Canonical ordered NBA feature registry.
+"""Canonical ordered per-sport feature registries.
 
-The model's input vector follows this exact order; feature_names stored in
-model_versions must match. Only features honestly computable from the Phase
-1 statistics-service and lines-service APIs are included. Documented
-exclusions (no data source yet): travel distance, altitude, timezone shift
-(no venue coordinates), head-to-head history, public/sharp money split,
-weather (indoor sport).
+Each sport's model input vector follows its tuple's exact order;
+feature_names stored in model_versions must match. The NBA tuple is
+order-locked into the trained basketball model — never reorder it. Only
+features honestly computable from the Phase 1 statistics-service and
+lines-service APIs are included. Documented exclusions (no data source
+yet): travel distance, altitude, timezone shift (no venue coordinates),
+head-to-head history, public/sharp money split, weather (indoor sport).
 """
 
 NBA_FEATURES: tuple[str, ...] = (
@@ -56,3 +57,15 @@ NBA_FEATURES: tuple[str, ...] = (
 )
 
 FeatureMap = dict[str, float | None]
+
+# Sport -> ordered feature tuple. New sports register here in their league
+# wave (ADR-026); until then get_features fails loudly for them.
+FEATURES_BY_SPORT: dict[str, tuple[str, ...]] = {"BASKETBALL": NBA_FEATURES}
+
+
+def get_features(sport: str) -> tuple[str, ...]:
+    """Return the ordered feature tuple for a sport."""
+    try:
+        return FEATURES_BY_SPORT[sport]
+    except KeyError:
+        raise ValueError(f"no feature registry for {sport}; added in its league wave") from None

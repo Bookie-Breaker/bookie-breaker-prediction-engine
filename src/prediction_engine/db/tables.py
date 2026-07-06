@@ -32,9 +32,9 @@ metadata = MetaData(schema="predictions")
 # SQLAlchemy can bind and validate parameters (the types are NOT created by
 # this service).
 _ENUM_VALUES: dict[str, tuple[str, ...]] = {
-    "sport_enum": ("FOOTBALL", "BASKETBALL", "BASEBALL"),
+    "sport_enum": ("FOOTBALL", "BASKETBALL", "BASEBALL", "SOCCER", "HOCKEY"),
     "market_type_enum": ("SPREAD", "TOTAL", "MONEYLINE", "PLAYER_PROP", "TEAM_PROP", "GAME_PROP", "FUTURE", "LIVE"),
-    "league_enum": ("NFL", "NBA", "MLB", "NCAA_FB", "NCAA_BB", "NCAA_BSB"),
+    "league_enum": ("NFL", "NBA", "MLB", "NCAA_FB", "NCAA_BB", "NCAA_BSB", "FIFA_WC", "EPL", "NHL", "NCAA_HKY"),
 }
 
 
@@ -83,6 +83,8 @@ predictions = Table(
     Column("model_version_id", UUID(as_uuid=True), ForeignKey("model_versions.id"), nullable=False),
     Column("league", _enum("league_enum"), nullable=False),
     Column("market_type", _enum("market_type_enum"), nullable=False),
+    # Nullable: rows created before Phase 6 predate the side vocabulary (ADR-027)
+    Column("side", Text),
     Column("selection", Text, nullable=False),
     Column("predicted_probability", Numeric(6, 5), nullable=False),
     Column("simulation_probability", Numeric(6, 5)),
@@ -99,6 +101,10 @@ predictions = Table(
     CheckConstraint(
         "confidence_lower >= 0 AND confidence_upper <= 1 AND confidence_lower <= confidence_upper",
         name="chk_predictions_confidence_range",
+    ),
+    CheckConstraint(
+        "side IN ('HOME', 'AWAY', 'DRAW', 'OVER', 'UNDER')",
+        name="chk_predictions_side",
     ),
     Index("idx_predictions_game_market", "game_external_id", "market_type", text("created_at DESC")),
     Index("idx_predictions_model_version", "model_version_id", text("created_at DESC")),

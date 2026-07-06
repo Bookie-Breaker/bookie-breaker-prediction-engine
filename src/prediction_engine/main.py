@@ -42,7 +42,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         model_repo = ModelVersionRepository(engine)
         prediction_repo = PredictionRepository(engine)
-        registry = ModelRegistry(model_repo, settings.model_dir)
+        registry = ModelRegistry(model_repo, settings.model_dir, sports=settings.prediction_sports_list)
         await registry.try_bootstrap()
 
         app.state.model_repo = model_repo

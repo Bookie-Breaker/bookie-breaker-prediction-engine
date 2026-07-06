@@ -140,9 +140,9 @@ class StatisticsClient(ServiceClient):
         )
         return [Game.model_validate(item) for item in data]
 
-    async def get_injuries(self, team_id: str) -> list[InjuryReport]:
+    async def get_injuries(self, team_id: str, league: str) -> list[InjuryReport]:
         data = await self.get_data(
-            "/api/v1/stats/injuries", f"injuries for team {team_id}", {"league": "NBA", "team_id": team_id}
+            "/api/v1/stats/injuries", f"injuries for team {team_id}", {"league": league, "team_id": team_id}
         )
         return [InjuryReport.model_validate(item) for item in data]
 

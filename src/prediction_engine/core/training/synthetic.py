@@ -1,4 +1,4 @@
-"""Seeded synthetic training data for the bootstrap model.
+"""Seeded synthetic training data for per-sport bootstrap models.
 
 Real NBA training data collection (scripts/collect_nba_data.py) is deferred
 to the verification session (offseason + datacenter IP blocking risk).
@@ -16,6 +16,8 @@ Embedded true effects the model can learn:
 - injury impact differential: -0.03 per normalized unit
 - home back-to-back: -0.015
 """
+
+from collections.abc import Callable
 
 import numpy as np
 
@@ -106,3 +108,16 @@ def generate_synthetic_dataset(n_rows: int = 6_000, seed: int = 7, n_seasons: in
         features.append(row)
 
     return TrainingSet(features=features, sim_probs=sim_probs, outcomes=outcomes, seasons=seasons)
+
+
+# Sport -> synthetic bootstrap generator. Each league wave registers its
+# sport's generator here (ADR-026); until then bootstrap fails loudly.
+SYNTHETIC_GENERATORS: dict[str, Callable[[], TrainingSet]] = {"BASKETBALL": generate_synthetic_dataset}
+
+
+def get_synthetic_generator(sport: str) -> Callable[[], TrainingSet]:
+    """Return the synthetic dataset generator for a sport."""
+    try:
+        return SYNTHETIC_GENERATORS[sport]
+    except KeyError:
+        raise ValueError(f"no synthetic generator registered for {sport}; added in its league wave") from None

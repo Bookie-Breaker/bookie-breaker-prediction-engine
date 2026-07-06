@@ -2,7 +2,7 @@
 
 No pickle anywhere: the XGBoost native format plus JSON parameter files
 mean inference needs neither sklearn nor version-pinned deserialization.
-Layout: $MODEL_DIR/basketball/unified/<version_tag>/
+Layout: $MODEL_DIR/{sport_lowercase}/unified/<version_tag>/
 """
 
 import json
@@ -61,7 +61,7 @@ class ArtifactBundle:
 
 
 def find_latest_artifact(model_dir: Path, sport_dir: str = "basketball") -> Path | None:
-    """Locate the most recently created artifact directory under MODEL_DIR."""
+    """Locate the most recently created artifact directory for a sport under MODEL_DIR."""
     base = model_dir / sport_dir / "unified"
     if not base.is_dir():
         return None

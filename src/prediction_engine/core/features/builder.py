@@ -51,13 +51,13 @@ class FeatureBuilder:
         self._lines = lines
         self._reconciler = reconciler
 
-    async def _team_features(self, team_id: str, prefix: str, game_date: date) -> FeatureMap:
+    async def _team_features(self, team_id: str, prefix: str, game_date: date, league: str) -> FeatureMap:
         season, last5, last10, recent_games, injuries = await asyncio.gather(
             self._statistics.get_team_stats(team_id),
             self._statistics.get_team_stats(team_id, rolling_window=5),
             self._statistics.get_team_stats(team_id, rolling_window=10),
             self._statistics.list_recent_games(team_id, date_to=game_date.isoformat()),
-            self._statistics.get_injuries(team_id),
+            self._statistics.get_injuries(team_id, league),
         )
 
         players = {}
@@ -99,8 +99,8 @@ class FeatureBuilder:
     async def build(self, game: Game) -> FeatureBundle:
         game_date = _game_date(game)
         home, away, (market_block, lines_id) = await asyncio.gather(
-            self._team_features(game.home_team.id, "home", game_date),
-            self._team_features(game.away_team.id, "away", game_date),
+            self._team_features(game.home_team.id, "home", game_date, game.league),
+            self._team_features(game.away_team.id, "away", game_date, game.league),
             self._market_block(game),
         )
 

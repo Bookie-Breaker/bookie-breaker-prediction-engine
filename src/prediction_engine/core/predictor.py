@@ -10,7 +10,8 @@ import hashlib
 import json
 import logging
 import uuid
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, cast
 
 import numpy as np
 import redis.asyncio as aioredis
@@ -22,6 +23,7 @@ from prediction_engine.api.schemas import (
     PredictionGroupData,
     PredictionItem,
     PredictionRequest,
+    Side,
 )
 from prediction_engine.clients.lines import BestLine, LinesClient
 from prediction_engine.clients.reconcile import GameReconciler
@@ -30,6 +32,7 @@ from prediction_engine.clients.statistics import Game, StatisticsClient
 from prediction_engine.core.edges import edge_percentage
 from prediction_engine.core.features.builder import FeatureBuilder
 from prediction_engine.core.features.registry import FeatureMap
+from prediction_engine.core.leagues import THREE_WAY_MONEYLINE_SPORTS, sport_for_league
 from prediction_engine.core.model.registry import ModelRegistry
 from prediction_engine.db.repository import PredictionRecord, PredictionRepository
 from prediction_engine.events.publisher import publish_prediction_completed
@@ -52,6 +55,22 @@ def _interpolate(grid: dict[str, float], target: float) -> tuple[float, float]:
 def _half_line(value: float) -> float:
     """Snap to the nearest half-point line (never a whole number)."""
     return round(value - 0.5) + 0.5
+
+
+# Default side per market for prediction rows persisted before Phase 6
+# (side is NULL on those rows; the single row per market was always the
+# HOME/OVER perspective).
+_DEFAULT_SIDE = {"SPREAD": "HOME", "MONEYLINE": "HOME", "TOTAL": "OVER"}
+
+
+@dataclass(frozen=True)
+class _RowInputs:
+    """Per-prediction-row inputs derived from one market of one game."""
+
+    side: str
+    selection: str
+    sim_probability: float
+    implied_probability: float | None
 
 
 class Predictor:
@@ -77,8 +96,14 @@ class Predictor:
         self._redis = redis_client
         self._idempotency_ttl = idempotency_ttl
 
-    async def _best_lines_by_market(self, lines_game_id: str | None) -> dict[str, BestLine]:
-        """Best HOME/OVER line per market type, when lines are available."""
+    async def _best_lines_by_market(self, lines_game_id: str | None) -> dict[tuple[str, str], BestLine]:
+        """Best line per (market type, side), when lines are available.
+
+        SPREAD keeps the HOME side and TOTAL keeps OVER (the single
+        perspective each prediction row targets); MONEYLINE keeps every side
+        (HOME/AWAY/DRAW) so three-way rows each carry their own
+        market-implied probability (ADR-027).
+        """
         if lines_game_id is None:
             return {}
         try:
@@ -86,15 +111,17 @@ class Predictor:
         except Exception:  # noqa: BLE001 - lines are optional at predict time
             logger.warning("best lines unavailable for %s", lines_game_id, exc_info=True)
             return {}
-        result: dict[str, BestLine] = {}
+        result: dict[tuple[str, str], BestLine] = {}
         for line in best:
             if (
-                line.market_type in ("SPREAD", "MONEYLINE")
+                line.market_type == "MONEYLINE"
+                and line.side in ("HOME", "AWAY", "DRAW")
+                or line.market_type == "SPREAD"
                 and line.side == "HOME"
                 or line.market_type == "TOTAL"
                 and line.side == "OVER"
             ):
-                result[line.market_type] = line
+                result[(line.market_type, line.side)] = line
         return result
 
     def _market_inputs(
@@ -102,27 +129,48 @@ class Predictor:
         market: str,
         run: SimulationRun,
         game: Game,
-        best_line: BestLine | None,
-    ) -> tuple[str, float, float | None]:
-        """Return (selection, simulation probability, implied probability)."""
+        best_lines: dict[tuple[str, str], BestLine],
+        three_way_moneyline: bool,
+    ) -> list[_RowInputs]:
+        """Return the prediction-row inputs a market emits (one per side).
+
+        Two-way markets emit a single HOME (spread/moneyline) or OVER
+        (total) row, exactly as before Phase 6. Three-way moneylines
+        (ADR-027) emit HOME/DRAW/AWAY rows: draw from the simulation's
+        draw_probability, away as the floored complement.
+        """
         result = run.result
-        implied = best_line.implied_probability if best_line is not None else None
+
+        def implied(side: str) -> float | None:
+            best = best_lines.get((market, side))
+            return best.implied_probability if best is not None else None
 
         if market == "MONEYLINE":
-            return f"{game.home_team.name} ML", result.home_win_probability, implied
+            home = _RowInputs("HOME", f"{game.home_team.name} ML", result.home_win_probability, implied("HOME"))
+            if not three_way_moneyline:
+                return [home]
+            draw_prob = result.draw_probability
+            away_prob = max(0.0, 1.0 - result.home_win_probability - draw_prob)
+            return [
+                home,
+                _RowInputs("DRAW", "Draw", draw_prob, implied("DRAW")),
+                _RowInputs("AWAY", f"{game.away_team.name} ML", away_prob, implied("AWAY")),
+            ]
 
         if market == "SPREAD":
+            best_line = best_lines.get(("SPREAD", "HOME"))
             target = best_line.line_value if best_line and best_line.line_value is not None else None
             if target is None:
                 target = _half_line(-result.mean_margin)
             line, sim_prob = _interpolate(result.spread_cover_probabilities, target)
-            return f"{game.home_team.name} {line:+g}", sim_prob, implied
+            return [_RowInputs("HOME", f"{game.home_team.name} {line:+g}", sim_prob, implied("HOME"))]
 
+        best_line = best_lines.get(("TOTAL", "OVER"))
         target = best_line.line_value if best_line and best_line.line_value is not None else None
         if target is None:
             target = _half_line(result.mean_total)
         line, sim_prob = _interpolate(result.total_over_probabilities, target)
-        return f"Over {line:g}", sim_prob, implied
+        return [_RowInputs("OVER", f"Over {line:g}", sim_prob, implied("OVER"))]
 
     async def create_predictions(
         self, request: PredictionRequest, idempotency_key: str | None = None
@@ -143,50 +191,70 @@ class Predictor:
                 f"Simulation run {request.simulation_run_id} belongs to game {run.game_id}, not {request.game_id}"
             )
 
+        try:
+            sport = sport_for_league(game.league)
+        except ValueError as exc:
+            raise UnprocessableError(str(exc)) from exc
+        three_way_moneyline = sport in THREE_WAY_MONEYLINE_SPORTS
+
         bundle = await self._features.build(game)
         bundle.sources["simulation_run_id"] = request.simulation_run_id
         best_lines = await self._best_lines_by_market(bundle.lines_game_external_id)
 
         rows: list[dict[str, Any]] = []
-        importances: list[dict[str, float]] = []
         for market in request.market_types:
-            loaded = await self._registry.get_active(market)
+            try:
+                loaded = await self._registry.get_active(sport, market)
+            except ValueError as exc:  # sport has no bootstrap path yet (later league wave)
+                raise UnprocessableError(str(exc)) from exc
             if loaded is None:
-                raise UnprocessableError(f"No active model for BASKETBALL {market}")
+                raise UnprocessableError(f"No active model for {sport} {market}")
 
-            selection, sim_prob, implied = self._market_inputs(market, run, game, best_lines.get(market))
-            features: FeatureMap = dict(bundle.features)
-            features["sim_probability"] = sim_prob
-            features["sim_margin_mean"] = run.result.mean_margin
-            features["sim_total_mean"] = run.result.mean_total
-            features["sim_converged"] = 1.0 if run.converged else 0.0
-            features["market_is_spread"] = 1.0 if market == "SPREAD" else 0.0
-            features["market_is_total"] = 1.0 if market == "TOTAL" else 0.0
-            features["market_is_moneyline"] = 1.0 if market == "MONEYLINE" else 0.0
+            calibrated: list[float] = []
+            importances: list[dict[str, float]] = []
+            row_inputs = self._market_inputs(market, run, game, best_lines, three_way_moneyline)
+            for inputs in row_inputs:
+                features: FeatureMap = dict(bundle.features)
+                features["sim_probability"] = inputs.sim_probability
+                features["sim_margin_mean"] = run.result.mean_margin
+                features["sim_total_mean"] = run.result.mean_total
+                features["sim_converged"] = 1.0 if run.converged else 0.0
+                features["market_is_spread"] = 1.0 if market == "SPREAD" else 0.0
+                features["market_is_total"] = 1.0 if market == "TOTAL" else 0.0
+                features["market_is_moneyline"] = 1.0 if market == "MONEYLINE" else 0.0
 
-            adjustment = loaded.bundle.model.predict_adjustment(features)
-            raw = float(np.clip(sim_prob + adjustment, 0.01, 0.99))
-            predicted = round(loaded.bundle.calibrator.apply(raw), 5)
-            lower, upper = loaded.bundle.conformal.interval(predicted)
-            importance = loaded.bundle.model.feature_importance(features)
-            importances.append(importance)
+                adjustment = loaded.bundle.model.predict_adjustment(features)
+                raw = float(np.clip(inputs.sim_probability + adjustment, 0.01, 0.99))
+                calibrated.append(loaded.bundle.calibrator.apply(raw))
+                importances.append(loaded.bundle.model.feature_importance(features))
 
-            rows.append(
-                {
-                    "game_external_id": request.game_id,
-                    "model_version_id": loaded.record.id,
-                    "league": game.league,
-                    "market_type": market,
-                    "selection": selection,
-                    "predicted_probability": predicted,
-                    "simulation_probability": round(sim_prob, 5),
-                    "implied_probability": round(implied, 5) if implied is not None else None,
-                    "edge": round(predicted - implied, 5) if implied is not None else None,
-                    "confidence_lower": lower,
-                    "confidence_upper": upper,
-                    "feature_importance": importance,
-                }
-            )
+            if len(calibrated) > 1:
+                # Independently calibrated three-way probabilities are
+                # renormalized to a proper distribution (ADR-027).
+                total = sum(calibrated)
+                calibrated = [value / total for value in calibrated]
+
+            for inputs, value, importance in zip(row_inputs, calibrated, importances, strict=True):
+                predicted = round(value, 5)
+                lower, upper = loaded.bundle.conformal.interval(predicted)
+                implied = inputs.implied_probability
+                rows.append(
+                    {
+                        "game_external_id": request.game_id,
+                        "model_version_id": loaded.record.id,
+                        "league": game.league,
+                        "market_type": market,
+                        "side": inputs.side,
+                        "selection": inputs.selection,
+                        "predicted_probability": predicted,
+                        "simulation_probability": round(inputs.sim_probability, 5),
+                        "implied_probability": round(implied, 5) if implied is not None else None,
+                        "edge": round(predicted - implied, 5) if implied is not None else None,
+                        "confidence_lower": lower,
+                        "confidence_upper": upper,
+                        "feature_importance": importance,
+                    }
+                )
 
         records = await self._repo.insert_predictions(
             rows,
@@ -232,7 +300,8 @@ class Predictor:
 
         edges: list[EdgeItem] = []
         for record in records:
-            best = best_lines.get(record.market_type)
+            side = record.side or _DEFAULT_SIDE.get(record.market_type, "HOME")
+            best = best_lines.get((record.market_type, side))
             if best is None or best.implied_probability is None:
                 continue
             edge_pct = edge_percentage(record.predicted_probability, best.implied_probability)
@@ -258,6 +327,8 @@ def _to_item(record: PredictionRecord) -> PredictionItem:
     return PredictionItem(
         id=str(record.id),
         market_type=record.market_type,
+        # the check constraint guarantees the side vocabulary at the DB layer
+        side=cast("Side | None", record.side),
         selection=record.selection,
         predicted_probability=record.predicted_probability,
         simulation_probability=record.simulation_probability,
