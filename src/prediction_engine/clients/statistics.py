@@ -77,6 +77,10 @@ class AdvancedStats(BaseModel):
     true_shooting_pct: float = 0.0
     turnover_pct: float = 0.0
     offensive_rebound_pct: float = 0.0
+    # Opponent-adjusted efficiency margin (NCAA_BB via CBBD; absent -- and
+    # left at the 0.0 default -- for leagues without an adjusted-ratings
+    # source such as the NBA).
+    adjusted_efficiency_margin: float = 0.0
 
 
 class SoccerStats(BaseModel):
@@ -119,6 +123,42 @@ class BaseballStats(BaseModel):
     bullpen_era: float = 0.0
 
 
+class FootballStats(BaseModel):
+    """Football-specific block (FOOTBALL-sport leagues only; ADR-026).
+
+    EPA metrics come from nflverse team stats and exist for the NFL only;
+    NCAA_FB carries SP+ ratings from CFBD instead. Absent fields keep the
+    0.0 default, so the builder league-gates EPA and SP+ to None rather
+    than feeding the other league's placeholder zeros to the model.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    points_per_game: float = 0.0
+    points_allowed_per_game: float = 0.0
+    drives_per_game: float = 0.0
+    points_per_drive_off: float = 0.0
+    points_per_drive_def: float = 0.0
+    epa_per_play_off: float = 0.0
+    epa_per_play_def: float = 0.0
+    turnover_margin_per_game: float = 0.0
+    sp_plus_rating: float = 0.0
+
+
+class HockeyStats(BaseModel):
+    """Hockey-specific block (HOCKEY-sport leagues only; ADR-026)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    goals_for_per_game: float = 0.0
+    goals_against_per_game: float = 0.0
+    shots_for_per_game: float = 0.0
+    shots_against_per_game: float = 0.0
+    power_play_pct: float = 0.0
+    penalty_kill_pct: float = 0.0
+    team_save_pct: float = 0.0
+
+
 class StatBlocks(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -127,6 +167,8 @@ class StatBlocks(BaseModel):
     advanced: AdvancedStats = AdvancedStats()
     soccer: SoccerStats | None = None
     baseball: BaseballStats | None = None
+    football: FootballStats | None = None
+    hockey: HockeyStats | None = None
 
 
 class HomeAwaySplit(BaseModel):

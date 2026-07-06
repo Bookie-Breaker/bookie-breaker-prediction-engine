@@ -32,7 +32,7 @@ from prediction_engine.clients.statistics import Game, StatisticsClient
 from prediction_engine.core.edges import edge_percentage
 from prediction_engine.core.features.builder import FeatureBuilder
 from prediction_engine.core.features.registry import FeatureMap
-from prediction_engine.core.leagues import THREE_WAY_MONEYLINE_SPORTS, sport_for_league
+from prediction_engine.core.leagues import THREE_WAY_MONEYLINE_SPORTS, model_key_for_league, sport_for_league
 from prediction_engine.core.model.registry import ModelRegistry
 from prediction_engine.db.repository import PredictionRecord, PredictionRepository
 from prediction_engine.events.publisher import publish_prediction_completed
@@ -193,6 +193,9 @@ class Predictor:
 
         try:
             sport = sport_for_league(game.league)
+            # the model / feature-registry key: the sport for pooled models,
+            # the league for single-league models (NCAA_BB; see leagues.py)
+            model_key = model_key_for_league(game.league)
         except ValueError as exc:
             raise UnprocessableError(str(exc)) from exc
         three_way_moneyline = sport in THREE_WAY_MONEYLINE_SPORTS
@@ -204,11 +207,11 @@ class Predictor:
         rows: list[dict[str, Any]] = []
         for market in request.market_types:
             try:
-                loaded = await self._registry.get_active(sport, market)
+                loaded = await self._registry.get_active(model_key, market)
             except ValueError as exc:  # sport has no bootstrap path yet (later league wave)
                 raise UnprocessableError(str(exc)) from exc
             if loaded is None:
-                raise UnprocessableError(f"No active model for {sport} {market}")
+                raise UnprocessableError(f"No active model for {model_key} {market}")
 
             calibrated: list[float] = []
             importances: list[dict[str, float]] = []

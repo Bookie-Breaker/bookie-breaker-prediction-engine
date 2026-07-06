@@ -25,7 +25,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from prediction_engine.core.training.synthetic import get_synthetic_generator  # noqa: E402
 from prediction_engine.core.training.train import save_artifact, train_model  # noqa: E402
 
-SPORTS = ["BASKETBALL", "FOOTBALL", "BASEBALL", "SOCCER", "HOCKEY"]
+# Model keys: the five sports plus NCAA_BB, which trains its own
+# single-league model (see core/leagues.py).
+SPORTS = ["BASKETBALL", "FOOTBALL", "BASEBALL", "SOCCER", "HOCKEY", "NCAA_BB"]
 
 
 def load_parquet_dataset(path: Path, sport: str):  # type: ignore[no-untyped-def]

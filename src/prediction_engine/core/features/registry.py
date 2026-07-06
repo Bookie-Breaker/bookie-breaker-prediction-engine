@@ -166,14 +166,181 @@ BASEBALL_FEATURES: tuple[str, ...] = (
     "line_consensus_std",
 )
 
+# Football pools NFL and NCAA_FB into one FOOTBALL model with the league
+# as a one-hot feature (ADR-026); NCAA_FB is the zero level. The sim block
+# keeps sim_draw_probability because NFL regular-season games can end tied
+# (the drive-based plugin emits a rare ~0.3-1% tie mass, ADR-018) -- but
+# there is NO selection_is_draw: the moneyline stays two-way and a tied
+# final grades as PUSH (ADR-027), so tie risk is a per-game shading signal
+# rather than a third selection. EPA metrics come from nflverse and exist
+# for the NFL only (None for college); SP+ ratings come from CFBD and
+# exist for NCAA_FB only (None for the NFL) -- the league one-hot lets the
+# model branch on which block is populated. Bye-week flags are derived
+# from rest days (> 10 full days off in a weekly sport means the bye);
+# back-to-backs cannot happen in football, so the flag is excluded.
+# Documented exclusions (no honest data source in the Phase 6
+# statistics-service football block): injuries (no validated football
+# injury-impact proxy; the NBA proxy is minutes-based), quarterback status
+# (no starter feed equivalent to baseball's probable pitchers), weather,
+# travel distance, and head-to-head history.
+FOOTBALL_FEATURES: tuple[str, ...] = (
+    # simulation-derived (per-market: sim_probability varies by market type)
+    "sim_probability",
+    "sim_margin_mean",
+    "sim_total_mean",
+    "sim_draw_probability",
+    "sim_converged",
+    # market type one-hot (single unified model, market as feature)
+    "market_is_spread",
+    "market_is_total",
+    "market_is_moneyline",
+    # season strength (FootballStats block)
+    "home_points_per_game",
+    "home_points_allowed_per_game",
+    "home_points_per_drive_off",
+    "home_points_per_drive_def",
+    "home_epa_per_play_off",
+    "home_epa_per_play_def",
+    "home_sp_plus_rating",
+    "home_turnover_margin_per_game",
+    "away_points_per_game",
+    "away_points_allowed_per_game",
+    "away_points_per_drive_off",
+    "away_points_per_drive_def",
+    "away_epa_per_play_off",
+    "away_epa_per_play_def",
+    "away_sp_plus_rating",
+    "away_turnover_margin_per_game",
+    # situational (weekly schedule: bye = > 10 full days off)
+    "home_rest_days",
+    "away_rest_days",
+    "home_bye_week",
+    "away_bye_week",
+    # league one-hot (ADR-026 pooled model; NCAA_FB is the baseline)
+    "league_is_nfl",
+    # market signal
+    "line_movement",
+    "n_books_reporting",
+    "line_consensus_std",
+)
+
+# Hockey is a single-league NHL model for now: NCAA_HKY remains gated on
+# Odds API line coverage (ADR-026), so no league one-hot until it lands
+# (it would join as league_is_nhl, mirroring FOOTBALL). No draw features:
+# NHL finals include overtime/shootout resolution, so the hockey plugin's
+# draw_probability is a constant 0.0 and a constant column carries no
+# signal -- the moneyline stays two-way (ADR-027 hockey note).
+# Back-to-backs are kept (the NBA situational module transfers directly):
+# the NHL schedule is dense enough that they are common and meaningful.
+# Documented exclusions (no honest data source in the Phase 6
+# statistics-service hockey block): starting goaltender identity (no
+# confirmed-starter feed; team_save_pct carries the aggregate goaltending
+# signal), injuries (no validated hockey injury-impact proxy), and
+# head-to-head history.
+HOCKEY_FEATURES: tuple[str, ...] = (
+    # simulation-derived (per-market: sim_probability varies by market type)
+    "sim_probability",
+    "sim_margin_mean",
+    "sim_total_mean",
+    "sim_converged",
+    # market type one-hot (single unified model, market as feature)
+    "market_is_spread",
+    "market_is_total",
+    "market_is_moneyline",
+    # season strength (HockeyStats block)
+    "home_goals_for_per_game",
+    "home_goals_against_per_game",
+    "home_shots_for_per_game",
+    "home_shots_against_per_game",
+    "home_power_play_pct",
+    "home_penalty_kill_pct",
+    "home_team_save_pct",
+    "away_goals_for_per_game",
+    "away_goals_against_per_game",
+    "away_shots_for_per_game",
+    "away_shots_against_per_game",
+    "away_power_play_pct",
+    "away_penalty_kill_pct",
+    "away_team_save_pct",
+    # situational (dense schedule: back-to-backs matter, as in the NBA)
+    "home_rest_days",
+    "away_rest_days",
+    "home_back_to_back",
+    "away_back_to_back",
+    # market signal
+    "line_movement",
+    "n_books_reporting",
+    "line_consensus_std",
+)
+
+# NCAA_BB trains its own single-league model rather than pooling into the
+# NBA's order-locked BASKETBALL tuple (see core/leagues.py): the college
+# scoring environment differs and CBBD supplies an opponent-adjusted
+# efficiency margin the NBA block lacks. The tuple clones the NBA feature
+# approach with two deliberate differences: no injury features
+# (null-documented -- there is no reliable college injury source, so the
+# columns would always be None), and adjusted_efficiency_margin per side
+# (the college analytics community's dominant team-strength signal). The
+# league stays implicit -- a single-league registry needs no one-hot,
+# exactly like the NBA's.
+NCAA_BB_FEATURES: tuple[str, ...] = (
+    # simulation-derived (per-market: sim_probability varies by market type)
+    "sim_probability",
+    "sim_margin_mean",
+    "sim_total_mean",
+    "sim_converged",
+    # market type one-hot (single unified model, market as feature)
+    "market_is_spread",
+    "market_is_total",
+    "market_is_moneyline",
+    # season strength
+    "home_offensive_rating",
+    "home_defensive_rating",
+    "home_pace",
+    "home_net_rating",
+    "home_adjusted_efficiency_margin",
+    "away_offensive_rating",
+    "away_defensive_rating",
+    "away_pace",
+    "away_net_rating",
+    "away_adjusted_efficiency_margin",
+    "pace_differential",
+    "net_rating_diff",
+    "home_away_split_diff",
+    # recent form (rolling windows served by statistics-service)
+    "home_last5_ppg",
+    "home_last5_ppg_allowed",
+    "home_three_pct_last5",
+    "home_net_rating_last10",
+    "away_last5_ppg",
+    "away_last5_ppg_allowed",
+    "away_three_pct_last5",
+    "away_net_rating_last10",
+    # situational
+    "home_rest_days",
+    "away_rest_days",
+    "rest_advantage",
+    "home_back_to_back",
+    "away_back_to_back",
+    # market signal
+    "line_movement",
+    "n_books_reporting",
+    "line_consensus_std",
+)
+
 FeatureMap = dict[str, float | None]
 
-# Sport -> ordered feature tuple. New sports register here in their league
-# wave (ADR-026); until then get_features fails loudly for them.
+# Model key -> ordered feature tuple. Keys are sports for pooled models and
+# the league name for single-league models (NCAA_BB; see core/leagues.py).
+# New sports register here in their league wave (ADR-026); until then
+# get_features fails loudly for them.
 FEATURES_BY_SPORT: dict[str, tuple[str, ...]] = {
     "BASKETBALL": NBA_FEATURES,
     "SOCCER": SOCCER_FEATURES,
     "BASEBALL": BASEBALL_FEATURES,
+    "FOOTBALL": FOOTBALL_FEATURES,
+    "HOCKEY": HOCKEY_FEATURES,
+    "NCAA_BB": NCAA_BB_FEATURES,
 }
 
 

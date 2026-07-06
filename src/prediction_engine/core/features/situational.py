@@ -13,6 +13,11 @@ def _parse_date(value: str) -> date | None:
         return None
 
 
+# A normal football week is 6 full days off (Sunday to Sunday); more than
+# 10 means the team sat out a week -- the bye (a Sunday-to-Sunday bye is 13).
+BYE_WEEK_REST_THRESHOLD = 10
+
+
 def rest_features(game_date: date, recent_games: list[Game], prefix: str) -> FeatureMap:
     """Rest days and back-to-back indicator from a team's completed games.
 
@@ -27,3 +32,15 @@ def rest_features(game_date: date, recent_games: list[Game], prefix: str) -> Fea
         return {f"{prefix}_rest_days": None, f"{prefix}_back_to_back": None}
     rest_days = max((game_date - played_dates[0]).days - 1, 0)
     return {f"{prefix}_rest_days": float(rest_days), f"{prefix}_back_to_back": 1.0 if rest_days == 0 else 0.0}
+
+
+def football_rest_features(game_date: date, recent_games: list[Game], prefix: str) -> FeatureMap:
+    """Rest days plus the coming-off-a-bye flag for weekly-schedule football.
+
+    Back-to-backs cannot happen in football, so that flag is replaced by a
+    bye-week indicator: more than BYE_WEEK_REST_THRESHOLD full days off.
+    None-propagation matches rest_features (no completed games -> both None).
+    """
+    rest = rest_features(game_date, recent_games, prefix)[f"{prefix}_rest_days"]
+    bye = None if rest is None else (1.0 if rest > BYE_WEEK_REST_THRESHOLD else 0.0)
+    return {f"{prefix}_rest_days": rest, f"{prefix}_bye_week": bye}

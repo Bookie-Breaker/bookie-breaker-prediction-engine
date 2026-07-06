@@ -17,7 +17,7 @@ from prediction_engine.clients.statistics import Game, ProbablePitcher, Statisti
 from prediction_engine.core.features.injuries import MAX_PLAYERS_CONSIDERED, injury_impact
 from prediction_engine.core.features.market import market_features
 from prediction_engine.core.features.registry import FeatureMap
-from prediction_engine.core.features.situational import rest_features
+from prediction_engine.core.features.situational import football_rest_features, rest_features
 from prediction_engine.core.leagues import LEAGUE_TO_SPORT
 
 logger = logging.getLogger(__name__)
@@ -159,6 +159,134 @@ class FeatureBuilder:
         features[f"{prefix}_rest_days"] = rest_features(game_date, recent_games, prefix)[f"{prefix}_rest_days"]
         return features
 
+    async def _football_team_features(self, team_id: str, prefix: str, game_date: date, league: str) -> FeatureMap:
+        """Team features from the FootballStats block (ADR-026).
+
+        EPA and SP+ are league-gated (null-documented, not an oversight):
+        EPA comes from nflverse and exists for the NFL only, SP+ comes from
+        CFBD and exists for NCAA_FB only. The contract leaves the other
+        league's fields absent, which the client model defaults to 0.0 --
+        gating on the league turns those placeholder zeros into None (NaN
+        to XGBoost) so the model never mistakes "no source" for "exactly
+        league average". No injury features (no validated football
+        injury-impact proxy); back-to-backs cannot happen in a weekly
+        sport, so the rest block carries rest_days plus the bye flag.
+        """
+        season, recent_games = await asyncio.gather(
+            self._statistics.get_team_stats(team_id),
+            self._statistics.list_recent_games(team_id, date_to=game_date.isoformat()),
+        )
+        football = season.stats.football
+        is_nfl = league == "NFL"
+        features: FeatureMap = {
+            f"{prefix}_points_per_game": (football.points_per_game or None) if football else None,
+            f"{prefix}_points_allowed_per_game": (football.points_allowed_per_game or None) if football else None,
+            f"{prefix}_points_per_drive_off": (football.points_per_drive_off or None) if football else None,
+            f"{prefix}_points_per_drive_def": (football.points_per_drive_def or None) if football else None,
+            # EPA and turnover margin are signed (0.0 is meaningful for the
+            # NFL), so they pass through unfiltered when their league owns them
+            f"{prefix}_epa_per_play_off": football.epa_per_play_off if football and is_nfl else None,
+            f"{prefix}_epa_per_play_def": football.epa_per_play_def if football and is_nfl else None,
+            f"{prefix}_sp_plus_rating": football.sp_plus_rating if football and not is_nfl else None,
+            f"{prefix}_turnover_margin_per_game": football.turnover_margin_per_game if football else None,
+        }
+        features.update(football_rest_features(game_date, recent_games, prefix))
+        return features
+
+    async def _hockey_team_features(self, team_id: str, prefix: str, game_date: date) -> FeatureMap:
+        """Team features from the HockeyStats block (ADR-026).
+
+        No injury features (no validated hockey injury-impact proxy) and no
+        starting-goaltender block (no confirmed-starter feed; team_save_pct
+        carries the aggregate goaltending signal). The NBA situational
+        module transfers directly: the NHL schedule is dense enough that
+        back-to-backs are common and meaningful.
+        """
+        season, recent_games = await asyncio.gather(
+            self._statistics.get_team_stats(team_id),
+            self._statistics.list_recent_games(team_id, date_to=game_date.isoformat()),
+        )
+        hockey = season.stats.hockey
+        features: FeatureMap = {
+            f"{prefix}_goals_for_per_game": (hockey.goals_for_per_game or None) if hockey else None,
+            f"{prefix}_goals_against_per_game": (hockey.goals_against_per_game or None) if hockey else None,
+            f"{prefix}_shots_for_per_game": (hockey.shots_for_per_game or None) if hockey else None,
+            f"{prefix}_shots_against_per_game": (hockey.shots_against_per_game or None) if hockey else None,
+            f"{prefix}_power_play_pct": (hockey.power_play_pct or None) if hockey else None,
+            f"{prefix}_penalty_kill_pct": (hockey.penalty_kill_pct or None) if hockey else None,
+            f"{prefix}_team_save_pct": (hockey.team_save_pct or None) if hockey else None,
+        }
+        features.update(rest_features(game_date, recent_games, prefix))
+        return features
+
+    async def _college_basketball_team_features(self, team_id: str, prefix: str, game_date: date) -> FeatureMap:
+        """Team features for NCAA_BB: the NBA block minus injuries plus CBBD.
+
+        No injury features (null-documented, not an oversight): there is no
+        reliable college injury source, so the NBA's status-weighted proxy
+        has nothing honest to weight -- the columns would always be None.
+        adjusted_efficiency_margin is the CBBD opponent-adjusted rating on
+        the AdvancedStats block, absent (0.0 default -> None) elsewhere.
+        """
+        season, last5, last10, recent_games = await asyncio.gather(
+            self._statistics.get_team_stats(team_id),
+            self._statistics.get_team_stats(team_id, rolling_window=5),
+            self._statistics.get_team_stats(team_id, rolling_window=10),
+            self._statistics.list_recent_games(team_id, date_to=game_date.isoformat()),
+        )
+        features: FeatureMap = {
+            f"{prefix}_offensive_rating": season.stats.offensive.offensive_rating or None,
+            f"{prefix}_defensive_rating": season.stats.defensive.defensive_rating or None,
+            f"{prefix}_pace": season.stats.offensive.pace or None,
+            f"{prefix}_net_rating": season.stats.advanced.net_rating or None,
+            f"{prefix}_adjusted_efficiency_margin": season.stats.advanced.adjusted_efficiency_margin or None,
+            f"{prefix}_last5_ppg": last5.stats.offensive.points_per_game or None,
+            f"{prefix}_last5_ppg_allowed": last5.stats.defensive.points_allowed_per_game or None,
+            f"{prefix}_three_pct_last5": last5.stats.offensive.three_point_pct or None,
+            f"{prefix}_net_rating_last10": last10.stats.advanced.net_rating or None,
+        }
+        if prefix == "home":
+            features["home_away_split_diff"] = _split_diff(season)
+        features.update(rest_features(game_date, recent_games, prefix))
+        return features
+
+    async def _build_football(self, game: Game, game_date: date) -> tuple[FeatureMap, str | None]:
+        home, away, (market_block, lines_id) = await asyncio.gather(
+            self._football_team_features(game.home_team.id, "home", game_date, game.league),
+            self._football_team_features(game.away_team.id, "away", game_date, game.league),
+            self._market_block(game),
+        )
+        features: FeatureMap = {**home, **away, **market_block}
+        features["league_is_nfl"] = 1.0 if game.league == "NFL" else 0.0
+        return features, lines_id
+
+    async def _build_hockey(self, game: Game, game_date: date) -> tuple[FeatureMap, str | None]:
+        home, away, (market_block, lines_id) = await asyncio.gather(
+            self._hockey_team_features(game.home_team.id, "home", game_date),
+            self._hockey_team_features(game.away_team.id, "away", game_date),
+            self._market_block(game),
+        )
+        features: FeatureMap = {**home, **away, **market_block}
+        return features, lines_id
+
+    async def _build_college_basketball(self, game: Game, game_date: date) -> tuple[FeatureMap, str | None]:
+        home, away, (market_block, lines_id) = await asyncio.gather(
+            self._college_basketball_team_features(game.home_team.id, "home", game_date),
+            self._college_basketball_team_features(game.away_team.id, "away", game_date),
+            self._market_block(game),
+        )
+
+        features: FeatureMap = {**home, **away, **market_block}
+
+        def diff(a: str, b: str) -> float | None:
+            left, right = features.get(a), features.get(b)
+            return left - right if left is not None and right is not None else None
+
+        features["pace_differential"] = diff("home_pace", "away_pace")
+        features["net_rating_diff"] = diff("home_net_rating", "away_net_rating")
+        features["rest_advantage"] = diff("home_rest_days", "away_rest_days")
+        return features, lines_id
+
     async def _build_baseball(self, game: Game, game_date: date) -> tuple[FeatureMap, str | None]:
         home, away, (market_block, lines_id) = await asyncio.gather(
             self._baseball_team_features(game.home_team.id, "home", game_date),
@@ -223,6 +351,13 @@ class FeatureBuilder:
             features, lines_id = await self._build_soccer(game, game_date)
         elif sport == "BASEBALL":
             features, lines_id = await self._build_baseball(game, game_date)
+        elif sport == "FOOTBALL":
+            features, lines_id = await self._build_football(game, game_date)
+        elif sport == "HOCKEY":
+            features, lines_id = await self._build_hockey(game, game_date)
+        elif game.league == "NCAA_BB":
+            # BASKETBALL sport, but its own single-league model (see leagues.py)
+            features, lines_id = await self._build_college_basketball(game, game_date)
         else:
             features, lines_id = await self._build_basketball(game, game_date)
 
