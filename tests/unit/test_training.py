@@ -3,9 +3,13 @@
 import numpy as np
 import pytest
 
-from prediction_engine.core.features.registry import NBA_FEATURES, SOCCER_FEATURES
+from prediction_engine.core.features.registry import BASEBALL_FEATURES, NBA_FEATURES, SOCCER_FEATURES
 from prediction_engine.core.model.artifact import ArtifactBundle, find_latest_artifact
-from prediction_engine.core.training.synthetic import generate_soccer_synthetic_dataset, generate_synthetic_dataset
+from prediction_engine.core.training.synthetic import (
+    generate_baseball_synthetic_dataset,
+    generate_soccer_synthetic_dataset,
+    generate_synthetic_dataset,
+)
 from prediction_engine.core.training.train import save_artifact, train_model
 
 
@@ -155,3 +159,84 @@ class TestSoccerTraining:
         assert find_latest_artifact(tmp_path, "soccer") == artifact_dir
         loaded = ArtifactBundle.load(artifact_dir)
         assert loaded.feature_names == list(SOCCER_FEATURES)
+
+
+@pytest.fixture(scope="module")
+def baseball_dataset():
+    return generate_baseball_synthetic_dataset()
+
+
+@pytest.fixture(scope="module")
+def baseball_training_result(baseball_dataset):
+    return train_model(baseball_dataset, n_rounds=150, data_label="synthetic", sport="BASEBALL")
+
+
+class TestBaseballSyntheticDataset:
+    def test_deterministic_and_three_rows_per_game(self, baseball_dataset) -> None:
+        again = generate_baseball_synthetic_dataset()
+        assert len(baseball_dataset) == 3_000 * 3
+        assert np.array_equal(baseball_dataset.sim_probs, again.sim_probs)
+        assert np.array_equal(baseball_dataset.outcomes, again.outcomes)
+        assert baseball_dataset.features[0] == again.features[0]
+
+    def test_rows_cover_all_three_markets_two_way(self, baseball_dataset) -> None:
+        moneyline, spread, total = baseball_dataset.features[:3]
+        assert moneyline["market_is_moneyline"] == 1.0 and moneyline["market_is_spread"] == 0.0
+        assert spread["market_is_spread"] == 1.0 and spread["market_is_moneyline"] == 0.0
+        assert total["market_is_total"] == 1.0 and total["market_is_spread"] == 0.0
+        # no three-way features anywhere: baseball cannot tie
+        assert "selection_is_draw" not in moneyline
+        assert "sim_draw_probability" not in moneyline
+
+    def test_runs_scale_margins_and_totals(self, baseball_dataset) -> None:
+        mlb_rows = [f for f in baseball_dataset.features[::3] if f["league_is_mlb"] == 1.0]
+        ncaa_rows = [f for f in baseball_dataset.features[::3] if f["league_is_mlb"] == 0.0]
+        mlb_totals = np.array([f["sim_total_mean"] for f in mlb_rows])
+        assert 8.0 < float(mlb_totals.mean()) < 10.0  # runs, not points or goals
+        assert float(np.mean([f["sim_total_mean"] for f in ncaa_rows])) > float(mlb_totals.mean())
+        margins = np.array([f["sim_margin_mean"] for f in mlb_rows])
+        assert float(np.abs(margins).mean()) < 2.0  # single-run-scale edges
+
+    def test_starter_effect_dominates_team_effect(self, baseball_dataset) -> None:
+        rows = [
+            (features, outcome)
+            for features, outcome in zip(baseball_dataset.features[::3], baseball_dataset.outcomes[::3], strict=True)
+            if features["starter_fip_diff"] is not None
+        ]
+        fip_diff = np.array([features["starter_fip_diff"] for features, _ in rows])
+        team_diff = np.array([features["home_team_fip"] - features["away_team_fip"] for features, _ in rows])
+        outcomes = np.array([outcome for _, outcome in rows])
+
+        starter_gap = outcomes[fip_diff < 0].mean() - outcomes[fip_diff > 0].mean()
+        team_gap = outcomes[team_diff < 0].mean() - outcomes[team_diff > 0].mean()
+        assert starter_gap > 0.10  # a better announced starter moves win rate a lot
+        assert starter_gap > team_gap  # and more than team pitching quality does
+
+    def test_unannounced_starters_are_null_with_flag_zero(self, baseball_dataset) -> None:
+        moneyline_rows = baseball_dataset.features[::3]
+        unannounced = [f for f in moneyline_rows if f["home_starter_announced"] == 0.0]
+        announced = [f for f in moneyline_rows if f["home_starter_announced"] == 1.0]
+        assert unannounced and announced  # both regimes are represented
+        assert all(f["home_starter_fip"] is None for f in unannounced)
+        assert all(f["home_starter_fip"] is not None for f in announced)
+        assert all(f["starter_fip_diff"] is None for f in moneyline_rows if f["away_starter_announced"] == 0.0)
+
+
+class TestBaseballTraining:
+    def test_trains_end_to_end_and_beats_simulation_baseline(self, baseball_training_result) -> None:
+        metrics = baseball_training_result.metrics
+        assert metrics["brier_score"] < metrics["brier_score_simulation_baseline"]
+        assert baseball_training_result.training_samples > 0
+
+    def test_metadata_is_baseball_tagged(self, baseball_training_result) -> None:
+        metadata = baseball_training_result.bundle.metadata
+        assert metadata["feature_names"] == list(BASEBALL_FEATURES)
+        assert metadata["version_tag"].startswith("BASEBALL_unified_")
+        assert metadata["sport"] == "BASEBALL"
+
+    def test_artifact_saves_under_baseball_path(self, baseball_training_result, tmp_path) -> None:
+        artifact_dir = save_artifact(baseball_training_result, tmp_path)
+        assert artifact_dir.parent == tmp_path / "baseball" / "unified"
+        assert find_latest_artifact(tmp_path, "baseball") == artifact_dir
+        loaded = ArtifactBundle.load(artifact_dir)
+        assert loaded.feature_names == list(BASEBALL_FEATURES)

@@ -13,7 +13,7 @@ from datetime import date, datetime
 
 from prediction_engine.clients.lines import LinesClient
 from prediction_engine.clients.reconcile import GameReconciler
-from prediction_engine.clients.statistics import Game, StatisticsClient, TeamStats
+from prediction_engine.clients.statistics import Game, ProbablePitcher, StatisticsClient, TeamStats
 from prediction_engine.core.features.injuries import MAX_PLAYERS_CONSIDERED, injury_impact
 from prediction_engine.core.features.market import market_features
 from prediction_engine.core.features.registry import FeatureMap
@@ -35,6 +35,30 @@ def _game_date(game: Game) -> date:
         return datetime.fromisoformat(game.scheduled_start.replace("Z", "+00:00")).date()
     except ValueError:
         return date.today()
+
+
+def _starter_features(pitcher: ProbablePitcher | None, prefix: str) -> FeatureMap:
+    """Probable-starter features, null-safe for unannounced starters.
+
+    Unannounced (absent from the game payload) means stats are None (NaN to
+    XGBoost) with the announced flag at 0.0 -- the flag itself is signal,
+    because unannounced games have noisier outcomes. An announced starter
+    with missing season stats (a debut call-up) keeps flag 1.0 with None
+    stats.
+    """
+    if pitcher is None:
+        return {
+            f"{prefix}_starter_fip": None,
+            f"{prefix}_starter_era": None,
+            f"{prefix}_starter_kbb": None,
+            f"{prefix}_starter_announced": 0.0,
+        }
+    return {
+        f"{prefix}_starter_fip": pitcher.fip,
+        f"{prefix}_starter_era": pitcher.era,
+        f"{prefix}_starter_kbb": pitcher.k_bb_pct,
+        f"{prefix}_starter_announced": 1.0,
+    }
 
 
 def _split_diff(stats: TeamStats) -> float | None:
@@ -108,6 +132,47 @@ class FeatureBuilder:
         features[f"{prefix}_rest_days"] = rest_features(game_date, recent_games, prefix)[f"{prefix}_rest_days"]
         return features
 
+    async def _baseball_team_features(self, team_id: str, prefix: str, game_date: date) -> FeatureMap:
+        """Team features from the BaseballStats block (ADR-026).
+
+        No injury features for baseball in Wave 2 (a deliberate
+        null-documentation, not an oversight): get_injuries covers MLB
+        since the Wave 0 league generalization, but the NBA injury-impact
+        proxy is minutes-based and does not transfer to baseball, and the
+        probable-starter block already carries the dominant personnel
+        signal. A validated count-based IL feature can join in a later
+        wave. Back-to-backs are meaningless in a near-daily sport, so only
+        rest_days is kept from the rest block.
+        """
+        season, recent_games = await asyncio.gather(
+            self._statistics.get_team_stats(team_id),
+            self._statistics.list_recent_games(team_id, date_to=game_date.isoformat()),
+        )
+        baseball = season.stats.baseball
+        features: FeatureMap = {
+            f"{prefix}_runs_scored_per_game": (baseball.runs_scored_per_game or None) if baseball else None,
+            f"{prefix}_runs_allowed_per_game": (baseball.runs_allowed_per_game or None) if baseball else None,
+            f"{prefix}_team_woba": (baseball.team_woba or None) if baseball else None,
+            f"{prefix}_team_fip": (baseball.team_fip or None) if baseball else None,
+            f"{prefix}_bullpen_era": (baseball.bullpen_era or None) if baseball else None,
+        }
+        features[f"{prefix}_rest_days"] = rest_features(game_date, recent_games, prefix)[f"{prefix}_rest_days"]
+        return features
+
+    async def _build_baseball(self, game: Game, game_date: date) -> tuple[FeatureMap, str | None]:
+        home, away, (market_block, lines_id) = await asyncio.gather(
+            self._baseball_team_features(game.home_team.id, "home", game_date),
+            self._baseball_team_features(game.away_team.id, "away", game_date),
+            self._market_block(game),
+        )
+        features: FeatureMap = {**home, **away, **market_block}
+        features.update(_starter_features(game.home_probable_pitcher, "home"))
+        features.update(_starter_features(game.away_probable_pitcher, "away"))
+        home_fip, away_fip = features["home_starter_fip"], features["away_starter_fip"]
+        features["starter_fip_diff"] = home_fip - away_fip if home_fip is not None and away_fip is not None else None
+        features["league_is_mlb"] = 1.0 if game.league == "MLB" else 0.0
+        return features, lines_id
+
     async def _market_block(self, game: Game) -> tuple[FeatureMap, str | None]:
         lines_id = await self._reconciler.resolve(game)
         empty: FeatureMap = {"line_movement": None, "n_books_reporting": None, "line_consensus_std": None}
@@ -153,8 +218,11 @@ class FeatureBuilder:
 
     async def build(self, game: Game) -> FeatureBundle:
         game_date = _game_date(game)
-        if LEAGUE_TO_SPORT.get(game.league) == "SOCCER":
+        sport = LEAGUE_TO_SPORT.get(game.league)
+        if sport == "SOCCER":
             features, lines_id = await self._build_soccer(game, game_date)
+        elif sport == "BASEBALL":
+            features, lines_id = await self._build_baseball(game, game_date)
         else:
             features, lines_id = await self._build_basketball(game, game_date)
 

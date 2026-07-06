@@ -15,6 +15,25 @@ class TeamRef(BaseModel):
     abbreviation: str = ""
 
 
+class ProbablePitcher(BaseModel):
+    """Probable starting pitcher (BASEBALL leagues; present once announced).
+
+    Season pitching stats are embedded in the contract so no extra lookup
+    is needed; they stay None-able because a just-called-up starter can be
+    announced before season stats exist.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    name: str = ""
+    external_id: str = ""
+    throws: str = ""
+    era: float | None = None
+    fip: float | None = None
+    k_bb_pct: float | None = None
+    innings_pitched: float | None = None
+
+
 class Game(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -26,6 +45,8 @@ class Game(BaseModel):
     scheduled_start: str = ""
     season: int = 0
     season_type: str = ""
+    home_probable_pitcher: ProbablePitcher | None = None
+    away_probable_pitcher: ProbablePitcher | None = None
 
 
 class OffensiveStats(BaseModel):
@@ -77,6 +98,27 @@ class SoccerStats(BaseModel):
     form_points_last5: int = 0
 
 
+class BaseballStats(BaseModel):
+    """Baseball-specific block (BASEBALL-sport leagues only; ADR-026).
+
+    FIP and wOBA are computed in-service from official counting stats
+    using published seasonal constants.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    runs_scored_per_game: float = 0.0
+    runs_allowed_per_game: float = 0.0
+    team_woba: float = 0.0
+    team_obp: float = 0.0
+    team_slg: float = 0.0
+    batting_strikeout_pct: float = 0.0
+    batting_walk_pct: float = 0.0
+    team_era: float = 0.0
+    team_fip: float = 0.0
+    bullpen_era: float = 0.0
+
+
 class StatBlocks(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -84,6 +126,7 @@ class StatBlocks(BaseModel):
     defensive: DefensiveStats = DefensiveStats()
     advanced: AdvancedStats = AdvancedStats()
     soccer: SoccerStats | None = None
+    baseball: BaseballStats | None = None
 
 
 class HomeAwaySplit(BaseModel):

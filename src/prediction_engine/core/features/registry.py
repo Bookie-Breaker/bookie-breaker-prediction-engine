@@ -105,6 +105,67 @@ SOCCER_FEATURES: tuple[str, ...] = (
     "line_consensus_std",
 )
 
+# Baseball pools MLB and NCAA_BSB into one BASEBALL model with the league
+# as a one-hot feature (ADR-026); MLB is the dominant league, NCAA_BSB the
+# zero level. No draw features: baseball games cannot tie (extra innings),
+# so the moneyline stays two-way and the sim block has no
+# sim_draw_probability. The probable-starter block is the sport's defining
+# signal; when a starter is unannounced its stats are None (NaN to XGBoost)
+# and the announced flag is 0.0, so the model can learn that unannounced
+# games carry extra outcome noise. Documented exclusions from the
+# BaseballStats contract block: team_obp and team_slg (wOBA is the linear
+# combination of both -- keeping all three is pure collinearity),
+# batting_walk_pct (also priced into wOBA), batting_strikeout_pct (weak
+# marginal team-level signal once wOBA is known), team_era (FIP is the
+# defense-independent skill estimate; ERA adds fielding noise on top of the
+# same innings). Other exclusions (no honest data source): injuries (the
+# NBA impact proxy is minutes-based and does not transfer to baseball, and
+# the announced starter dominates the personnel signal -- see the builder),
+# back-to-backs (baseball plays near-daily; rest_days carries the schedule
+# signal), park factors, weather, platoon/handedness splits, day-night
+# splits, and head-to-head history.
+BASEBALL_FEATURES: tuple[str, ...] = (
+    # simulation-derived (per-market: sim_probability varies by market type)
+    "sim_probability",
+    "sim_margin_mean",
+    "sim_total_mean",
+    "sim_converged",
+    # market type one-hot (single unified model, market as feature)
+    "market_is_spread",
+    "market_is_total",
+    "market_is_moneyline",
+    # season strength (BaseballStats block)
+    "home_runs_scored_per_game",
+    "home_runs_allowed_per_game",
+    "home_team_woba",
+    "home_team_fip",
+    "home_bullpen_era",
+    "away_runs_scored_per_game",
+    "away_runs_allowed_per_game",
+    "away_team_woba",
+    "away_team_fip",
+    "away_bullpen_era",
+    # probable starters (game-level; None + flag 0.0 when unannounced)
+    "home_starter_fip",
+    "home_starter_era",
+    "home_starter_kbb",
+    "home_starter_announced",
+    "away_starter_fip",
+    "away_starter_era",
+    "away_starter_kbb",
+    "away_starter_announced",
+    "starter_fip_diff",
+    # situational
+    "home_rest_days",
+    "away_rest_days",
+    # league one-hot (ADR-026 pooled model; NCAA_BSB is the baseline)
+    "league_is_mlb",
+    # market signal
+    "line_movement",
+    "n_books_reporting",
+    "line_consensus_std",
+)
+
 FeatureMap = dict[str, float | None]
 
 # Sport -> ordered feature tuple. New sports register here in their league
@@ -112,6 +173,7 @@ FeatureMap = dict[str, float | None]
 FEATURES_BY_SPORT: dict[str, tuple[str, ...]] = {
     "BASKETBALL": NBA_FEATURES,
     "SOCCER": SOCCER_FEATURES,
+    "BASEBALL": BASEBALL_FEATURES,
 }
 
 
