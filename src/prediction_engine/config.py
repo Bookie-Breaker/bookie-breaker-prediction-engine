@@ -19,12 +19,17 @@ class Settings(BaseSettings):
     lines_service_url: str = "http://localhost:8001"
     simulation_service_url: str = "http://localhost:8003"
     model_dir: Path = Path("./models")
+    prediction_sports: str = "BASKETBALL"  # comma-separated sports to bootstrap at startup
 
     idempotency_ttl_seconds: int = 86_400  # 24h per api-contracts README
     game_map_ttl_seconds: int = 86_400  # statistics<->lines game id mapping cache
 
     otel_exporter_otlp_endpoint: str | None = None
     otel_service_name: str = "prediction-engine"
+
+    @property
+    def prediction_sports_list(self) -> list[str]:
+        return [sport.strip().upper() for sport in self.prediction_sports.split(",") if sport.strip()]
 
 
 @lru_cache

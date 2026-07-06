@@ -27,10 +27,11 @@ SIM_URL = "http://sim.test"
 
 INIT_SQL = """
 CREATE SCHEMA IF NOT EXISTS predictions;
-CREATE TYPE league_enum AS ENUM ('NFL', 'NBA', 'MLB', 'NCAA_FB', 'NCAA_BB', 'NCAA_BSB');
+CREATE TYPE league_enum AS ENUM
+    ('NFL', 'NBA', 'MLB', 'NCAA_FB', 'NCAA_BB', 'NCAA_BSB', 'FIFA_WC', 'EPL', 'NHL', 'NCAA_HKY');
 CREATE TYPE market_type_enum AS ENUM
     ('SPREAD', 'TOTAL', 'MONEYLINE', 'PLAYER_PROP', 'TEAM_PROP', 'GAME_PROP', 'FUTURE', 'LIVE');
-CREATE TYPE sport_enum AS ENUM ('FOOTBALL', 'BASKETBALL', 'BASEBALL');
+CREATE TYPE sport_enum AS ENUM ('FOOTBALL', 'BASKETBALL', 'BASEBALL', 'SOCCER', 'HOCKEY');
 """
 
 

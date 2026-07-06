@@ -1,4 +1,4 @@
-"""Train the NBA adjustment model and save (optionally register) the artifact.
+"""Train a sport's adjustment model and save (optionally register) the artifact.
 
 Usage:
     uv run python scripts/train.py --synthetic --out ./models
@@ -8,6 +8,10 @@ Usage:
 The synthetic path is the Phase 2 bootstrap (see core/training/synthetic.py);
 real data comes from scripts/collect_nba_data.py once graded outcomes exist.
 Registering requires the predictions schema to be migrated (alembic).
+
+Sports other than BASKETBALL become trainable in their league waves, when
+their feature registry and synthetic generator are registered (ADR-026);
+until then they fail with a clear registry error.
 """
 
 import argparse
@@ -18,25 +22,28 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from prediction_engine.core.training.synthetic import generate_synthetic_dataset  # noqa: E402
+from prediction_engine.core.training.synthetic import get_synthetic_generator  # noqa: E402
 from prediction_engine.core.training.train import save_artifact, train_model  # noqa: E402
 
+SPORTS = ["BASKETBALL", "FOOTBALL", "BASEBALL", "SOCCER", "HOCKEY"]
 
-def load_parquet_dataset(path: Path):  # type: ignore[no-untyped-def]
+
+def load_parquet_dataset(path: Path, sport: str):  # type: ignore[no-untyped-def]
     """Load a collected real-data training set (requires the train extra)."""
     import numpy as np
     import pandas as pd
 
-    from prediction_engine.core.features.registry import NBA_FEATURES
+    from prediction_engine.core.features.registry import get_features
     from prediction_engine.core.training.dataset import TrainingSet
 
+    feature_names = get_features(sport)
     frame = pd.read_parquet(path)
     required = {"sim_probability", "outcome", "season"}
     missing = required - set(frame.columns)
     if missing:
         raise SystemExit(f"training parquet is missing columns: {sorted(missing)}")
     features = [
-        {name: (None if pd.isna(row.get(name)) else float(row[name])) for name in NBA_FEATURES}
+        {name: (None if pd.isna(row.get(name)) else float(row[name])) for name in feature_names}
         for _, row in frame.iterrows()
     ]
     return TrainingSet(
@@ -47,7 +54,7 @@ def load_parquet_dataset(path: Path):  # type: ignore[no-untyped-def]
     )
 
 
-async def register(database_url: str, artifact_dir: Path) -> None:
+async def register(database_url: str, artifact_dir: Path, sport: str) -> None:
     from prediction_engine.core.model.artifact import ArtifactBundle
     from prediction_engine.db.engine import create_engine
     from prediction_engine.db.repository import ModelVersionRepository
@@ -57,7 +64,7 @@ async def register(database_url: str, artifact_dir: Path) -> None:
     repo = ModelVersionRepository(engine)
     trained_at = datetime.fromisoformat(str(bundle.metadata["trained_at"]))
     records = await repo.register(
-        sport="BASKETBALL",
+        sport=sport,
         market_types=["SPREAD", "TOTAL", "MONEYLINE"],
         version=bundle.version_tag,
         trained_at=trained_at,
@@ -74,7 +81,7 @@ async def register(database_url: str, artifact_dir: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--sport", default="BASKETBALL", choices=["BASKETBALL"])
+    parser.add_argument("--sport", default="BASKETBALL", choices=SPORTS)
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--synthetic", action="store_true", help="Train the synthetic bootstrap model")
     source.add_argument("--data", type=Path, help="Parquet file from scripts/collect_nba_data.py")
@@ -83,11 +90,11 @@ def main() -> None:
     parser.add_argument("--register-db", metavar="DATABASE_URL", help="Register + activate in this database")
     args = parser.parse_args()
 
-    dataset = generate_synthetic_dataset() if args.synthetic else load_parquet_dataset(args.data)
+    dataset = get_synthetic_generator(args.sport)() if args.synthetic else load_parquet_dataset(args.data, args.sport)
     label = "synthetic" if args.synthetic else f"real:{args.data.name}"
 
     started = datetime.now(tz=UTC)
-    result = train_model(dataset, n_rounds=args.rounds, data_label=label)
+    result = train_model(dataset, n_rounds=args.rounds, data_label=label, sport=args.sport)
     artifact_dir = save_artifact(result, args.out)
     elapsed = (datetime.now(tz=UTC) - started).total_seconds()
 
@@ -96,7 +103,7 @@ def main() -> None:
     print(f"artifact: {artifact_dir}")
 
     if args.register_db:
-        asyncio.run(register(args.register_db, artifact_dir))
+        asyncio.run(register(args.register_db, artifact_dir, args.sport))
 
 
 if __name__ == "__main__":

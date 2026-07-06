@@ -19,7 +19,7 @@ import xgboost as xgb
 
 from prediction_engine.core.calibration import PlattCalibrator
 from prediction_engine.core.conformal import SplitConformal
-from prediction_engine.core.features.registry import NBA_FEATURES
+from prediction_engine.core.features.registry import get_features
 from prediction_engine.core.model.artifact import ArtifactBundle
 from prediction_engine.core.model.xgb import AdjustmentModel
 from prediction_engine.core.training.dataset import TrainingSet
@@ -37,6 +37,11 @@ DEFAULT_XGB_PARAMS: dict[str, Any] = {
     "seed": 42,
 }
 DEFAULT_ROUNDS = 200
+
+# Version-tag prefix per sport. BASKETBALL keeps the historical "NBA" prefix
+# (locked into registered artifact tags since Phase 2); pooled-competition
+# sports such as SOCCER tag with the sport name (ADR-026).
+_VERSION_TAG_PREFIX: dict[str, str] = {"BASKETBALL": "NBA"}
 
 
 @dataclass
@@ -57,8 +62,9 @@ def train_model(
     n_rounds: int = DEFAULT_ROUNDS,
     params: dict[str, Any] | None = None,
     data_label: str = "synthetic",
+    sport: str = "BASKETBALL",
 ) -> TrainingResult:
-    feature_names = list(NBA_FEATURES)
+    feature_names = list(get_features(sport))
     params = {**DEFAULT_XGB_PARAMS, **(params or {})}
 
     last_season = int(dataset.seasons.max())
@@ -119,10 +125,11 @@ def train_model(
 
     trained_at = datetime.now(tz=UTC)
     content_hash = hashlib.sha256(json.dumps(metrics, sort_keys=True).encode()).hexdigest()[:8]
-    version_tag = f"NBA_unified_{trained_at:%Y%m%d}_{content_hash}"
+    tag_prefix = _VERSION_TAG_PREFIX.get(sport, sport)
+    version_tag = f"{tag_prefix}_unified_{trained_at:%Y%m%d}_{content_hash}"
     metadata = {
         "version_tag": version_tag,
-        "sport": "BASKETBALL",
+        "sport": sport,
         "algorithm": "xgboost",
         "data_label": data_label,
         "feature_names": feature_names,
@@ -140,6 +147,7 @@ def train_model(
 
 
 def save_artifact(result: TrainingResult, model_dir: Path) -> Path:
-    directory = model_dir / "basketball" / "unified" / result.bundle.version_tag
+    sport = str(result.bundle.metadata.get("sport", "BASKETBALL"))
+    directory = model_dir / sport.lower() / "unified" / result.bundle.version_tag
     result.bundle.save(directory)
     return directory

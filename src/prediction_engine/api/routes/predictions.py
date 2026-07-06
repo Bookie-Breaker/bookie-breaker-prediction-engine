@@ -52,6 +52,7 @@ async def get_prediction(
             game_id=record.game_external_id,
             model_version_id=item.model_version_id,
             market_type=item.market_type,
+            side=item.side,
             selection=item.selection,
             predicted_probability=item.predicted_probability,
             simulation_probability=item.simulation_probability,

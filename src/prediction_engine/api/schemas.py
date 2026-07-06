@@ -8,6 +8,13 @@ MarketType = Literal["SPREAD", "TOTAL", "MONEYLINE"]
 
 DEFAULT_MARKETS: list[MarketType] = ["SPREAD", "TOTAL", "MONEYLINE"]
 
+Side = Literal["HOME", "AWAY", "DRAW", "OVER", "UNDER"]
+
+_SIDE_FIELD = Field(
+    default=None,
+    description="Selection side (HOME, AWAY, DRAW, OVER, UNDER). Null for predictions created before Phase 6.",
+)
+
 
 class PredictionRequest(BaseModel):
     game_id: str
@@ -18,6 +25,7 @@ class PredictionRequest(BaseModel):
 class PredictionItem(BaseModel):
     id: str
     market_type: str
+    side: Side | None = _SIDE_FIELD
     selection: str
     predicted_probability: float
     simulation_probability: float | None
@@ -48,6 +56,7 @@ class PredictionDetailData(BaseModel):
     game_id: str
     model_version_id: str
     market_type: str
+    side: Side | None = _SIDE_FIELD
     selection: str
     predicted_probability: float
     simulation_probability: float | None

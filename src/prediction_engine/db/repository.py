@@ -35,6 +35,7 @@ class PredictionRecord:
     model_version_id: uuid.UUID
     league: str
     market_type: str
+    side: str | None
     selection: str
     predicted_probability: float
     simulation_probability: float | None
@@ -70,6 +71,7 @@ def _prediction_from_row(row: Row[Any]) -> PredictionRecord:
         model_version_id=row.model_version_id,
         league=row.league,
         market_type=row.market_type,
+        side=row.side,
         selection=row.selection,
         predicted_probability=float(row.predicted_probability),
         simulation_probability=float(row.simulation_probability) if row.simulation_probability is not None else None,
@@ -220,12 +222,18 @@ class PredictionRepository:
         market_types: list[str] | None = None,
         model_version_id: uuid.UUID | None = None,
     ) -> list[PredictionRecord]:
-        """Most recent prediction per market type for a game."""
+        """Most recent prediction per (market type, side) for a game.
+
+        Side is part of the distinct key so three-way moneyline batches
+        (HOME/DRAW/AWAY rows sharing one market type, ADR-027) are returned
+        in full; two-way markets emit exactly one side per batch, so their
+        behavior is unchanged.
+        """
         stmt = (
             select(predictions)
             .where(predictions.c.game_external_id == game_external_id)
-            .order_by(predictions.c.market_type, predictions.c.created_at.desc())
-            .distinct(predictions.c.market_type)
+            .order_by(predictions.c.market_type, predictions.c.side, predictions.c.created_at.desc())
+            .distinct(predictions.c.market_type, predictions.c.side)
         )
         if market_types:
             stmt = stmt.where(predictions.c.market_type.in_(market_types))
