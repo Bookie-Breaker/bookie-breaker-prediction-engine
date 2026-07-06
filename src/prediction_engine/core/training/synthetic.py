@@ -21,7 +21,7 @@ from collections.abc import Callable
 
 import numpy as np
 
-from prediction_engine.core.features.registry import NBA_FEATURES, SOCCER_FEATURES, FeatureMap
+from prediction_engine.core.features.registry import BASEBALL_FEATURES, NBA_FEATURES, SOCCER_FEATURES, FeatureMap
 from prediction_engine.core.training.dataset import TrainingSet
 
 SIM_DAMPENING = 0.7
@@ -39,6 +39,29 @@ SOCCER_SIM_DAMPENING = 0.6  # the soccer "simulation" underreacts too
 SOCCER_SIM_NOISE = 0.08  # logit-scale noise on simulated probabilities
 SOCCER_REST_EFFECT = 0.06  # log-goal swing per normalized rest-advantage unit
 KNOCKOUT_GOAL_FACTOR = 0.85  # knockouts are cagier -> fewer goals -> more draws
+
+# Baseball generative model (independent Poisson runs; MLB + NCAA_BSB pooled
+# per ADR-026): the dominant hidden effect is starter quality -- the
+# "simulation" only sees team-level rates, so the announced starter's FIP
+# diff is the model's biggest genuine correction signal, bigger than the
+# team-strength correction. Unannounced starters still pitch (their latent
+# quality shapes the outcome) but their stats are hidden from the features,
+# so unannounced games are irreducibly noisier -- which makes the announced
+# flags themselves informative.
+BASEBALL_BASE_RUNS = 4.5  # MLB average runs per team per game
+NCAA_BSB_BASE_RUNS = 5.9  # college baseball scores hotter
+BASEBALL_HOME_ADVANTAGE = 0.12  # additive runs, split across the two sides
+BASEBALL_TEAM_BAT_STD = 0.30  # latent offense spread (runs per game)
+BASEBALL_TEAM_PITCH_STD = 0.25  # latent staff spread (runs prevented per game)
+BASEBALL_STARTER_STD = 0.55  # latent starter spread (runs prevented) -- dominant
+BASEBALL_ANNOUNCE_RATE = 0.85  # share of games with a probable starter posted
+BASEBALL_SIM_DAMPENING = 0.65  # the baseball "simulation" underreacts too
+BASEBALL_SIM_NOISE = 0.12  # logit-scale noise on simulated probabilities
+BASEBALL_REST_EFFECT = 0.06  # runs swing per normalized rest-advantage unit
+BASEBALL_FIP_BASE = 4.10  # league-average FIP anchor
+BASEBALL_MLB_SHARE = 0.85  # MLB fraction of pooled rows (NCAA_BSB dormant)
+_MAX_RUNS = 20  # Poisson grid truncation; P(>20) is negligible at run rates
+_EXTRA_INNINGS_SLOPE = 0.35  # logit slope of P(home wins extras) on rate diff
 
 _MARKETS = ("SPREAD", "TOTAL", "MONEYLINE")
 
@@ -124,18 +147,23 @@ def generate_synthetic_dataset(n_rows: int = 6_000, seed: int = 7, n_seasons: in
 _MAX_GOALS = 12  # Poisson grid truncation; P(>12) is negligible at soccer rates
 
 
-def _poisson_pmf(rates: np.ndarray) -> np.ndarray:
-    """Per-game Poisson pmf over 0.._MAX_GOALS goals, shape (n, _MAX_GOALS+1)."""
-    goals = np.arange(_MAX_GOALS + 1)
-    log_factorial = np.concatenate(([0.0], np.cumsum(np.log(np.arange(1, _MAX_GOALS + 1)))))
-    result: np.ndarray = np.exp(-rates[:, None] + goals[None, :] * np.log(rates)[:, None] - log_factorial[None, :])
+def _poisson_pmf(rates: np.ndarray, max_count: int = _MAX_GOALS) -> np.ndarray:
+    """Per-game Poisson pmf over 0..max_count, shape (n, max_count+1)."""
+    counts = np.arange(max_count + 1)
+    log_factorial = np.concatenate(([0.0], np.cumsum(np.log(np.arange(1, max_count + 1)))))
+    result: np.ndarray = np.exp(-rates[:, None] + counts[None, :] * np.log(rates)[:, None] - log_factorial[None, :])
     return result
 
 
-def _dampen(true_probs: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+def _dampen(
+    true_probs: np.ndarray,
+    rng: np.random.Generator,
+    dampening: float = SOCCER_SIM_DAMPENING,
+    noise: float = SOCCER_SIM_NOISE,
+) -> np.ndarray:
     """The "simulation" underreacts: dampened logit response plus noise."""
     logits = np.log(true_probs / (1.0 - true_probs))
-    noisy = SOCCER_SIM_DAMPENING * logits + rng.normal(0.0, SOCCER_SIM_NOISE, true_probs.shape)
+    noisy = dampening * logits + rng.normal(0.0, noise, true_probs.shape)
     result: np.ndarray = np.clip(1.0 / (1.0 + np.exp(-noisy)), 0.02, 0.96)
     return result
 
@@ -302,11 +330,173 @@ def generate_soccer_synthetic_dataset(n_games: int = 1_200, seed: int = 11, n_se
     )
 
 
+def generate_baseball_synthetic_dataset(n_games: int = 3_000, seed: int = 13, n_seasons: int = 4) -> TrainingSet:
+    """Per-selection binary rows for the pooled BASEBALL bootstrap (ADR-026).
+
+    Each game emits three rows: a two-way HOME moneyline (baseball cannot
+    tie -- zero-margin Poisson mass is resolved as strength-weighted
+    extra-innings one-run wins), a run-line spread (the rate favorite laying
+    -1.5, the dog getting +1.5), and a totals (OVER) row. Truth is
+    independent Poisson runs from latent team batting/pitching plus starter
+    quality; the "simulation" sees dampened team-only rates, so starter FIP
+    (the dominant effect), rest advantage, and announcement status are
+    genuine signals for the model to learn.
+    """
+    rng = np.random.default_rng(seed)
+
+    is_mlb = rng.random(n_games) < BASEBALL_MLB_SHARE
+    base_runs = np.where(is_mlb, BASEBALL_BASE_RUNS, NCAA_BSB_BASE_RUNS)
+
+    bat_home = rng.normal(0.0, BASEBALL_TEAM_BAT_STD, n_games)
+    bat_away = rng.normal(0.0, BASEBALL_TEAM_BAT_STD, n_games)
+    pitch_home = rng.normal(0.0, BASEBALL_TEAM_PITCH_STD, n_games)
+    pitch_away = rng.normal(0.0, BASEBALL_TEAM_PITCH_STD, n_games)
+    starter_home = rng.normal(0.0, BASEBALL_STARTER_STD, n_games)
+    starter_away = rng.normal(0.0, BASEBALL_STARTER_STD, n_games)
+    announced_home = rng.random(n_games) < BASEBALL_ANNOUNCE_RATE
+    announced_away = rng.random(n_games) < BASEBALL_ANNOUNCE_RATE
+
+    rest_choices = np.array([0.0, 1.0, 2.0])
+    home_rest = rng.choice(rest_choices, n_games, p=[0.55, 0.35, 0.10])
+    away_rest = rng.choice(rest_choices, n_games, p=[0.55, 0.35, 0.10])
+    rest_norm = (home_rest - away_rest) / 2.0
+
+    # Base rates: what the simulation is allowed to know about (team level)
+    lambda_home = np.clip(base_runs + BASEBALL_HOME_ADVANTAGE / 2 + bat_home - pitch_away, 0.5, None)
+    lambda_away = np.clip(base_runs - BASEBALL_HOME_ADVANTAGE / 2 + bat_away - pitch_home, 0.5, None)
+
+    # True rates add the effects hidden from the simulation
+    true_home = np.clip(lambda_home - starter_away + BASEBALL_REST_EFFECT * rest_norm / 2, 0.3, None)
+    true_away = np.clip(lambda_away - starter_home - BASEBALL_REST_EFFECT * rest_norm / 2, 0.3, None)
+
+    # Simulation-visible outcome distribution from the base-rate Poisson grid
+    joint = _poisson_pmf(lambda_home, _MAX_RUNS)[:, :, None] * _poisson_pmf(lambda_away, _MAX_RUNS)[:, None, :]
+    joint /= joint.sum(axis=(1, 2), keepdims=True)
+    margin_pmf = np.stack(
+        [np.trace(joint, offset=-m, axis1=1, axis2=2) for m in range(-_MAX_RUNS, _MAX_RUNS + 1)], axis=1
+    )
+    # Baseball never ties: move the zero-margin mass into one-run wins,
+    # split by a strength-weighted extra-innings probability.
+    p_extra_home = _sigmoid(_EXTRA_INNINGS_SLOPE * (lambda_home - lambda_away))
+    tie_mass = margin_pmf[:, _MAX_RUNS].copy()
+    margin_pmf[:, _MAX_RUNS] = 0.0
+    margin_pmf[:, _MAX_RUNS + 1] += tie_mass * p_extra_home
+    margin_pmf[:, _MAX_RUNS - 1] += tie_mass * (1.0 - p_extra_home)
+
+    base_home = margin_pmf[:, _MAX_RUNS + 1 :].sum(axis=1)
+    run_lines = np.where(lambda_home >= lambda_away, -1.5, 1.5)  # favorite lays the run line
+    cover_minus = margin_pmf[:, _MAX_RUNS + 2 :].sum(axis=1)  # -1.5: win by 2+
+    cover_plus = margin_pmf[:, _MAX_RUNS - 1 :].sum(axis=1)  # +1.5: lose by <=1 or win
+    base_cover = np.where(run_lines < 0, cover_minus, cover_plus)
+
+    total_pmf = np.stack(
+        [np.trace(joint[:, ::-1, :], offset=t - _MAX_RUNS, axis1=1, axis2=2) for t in range(2 * _MAX_RUNS + 1)], axis=1
+    )
+    exp_total = lambda_home + lambda_away
+    total_lines = np.floor(exp_total + rng.uniform(-1.0, 1.0, n_games)) + 0.5
+    over_idx = np.ceil(total_lines).astype(np.int64)
+    total_cdf = total_pmf.cumsum(axis=1)
+    base_over = 1.0 - np.take_along_axis(total_cdf, (over_idx - 1)[:, None], axis=1)[:, 0]
+
+    sim_home = _dampen(base_home, rng, BASEBALL_SIM_DAMPENING, BASEBALL_SIM_NOISE)
+    sim_cover = _dampen(base_cover, rng, BASEBALL_SIM_DAMPENING, BASEBALL_SIM_NOISE)
+    sim_over = _dampen(base_over, rng, BASEBALL_SIM_DAMPENING, BASEBALL_SIM_NOISE)
+
+    # Actual game outcomes sampled from the true (starter-adjusted) rates
+    home_runs = rng.poisson(true_home).astype(np.int64)
+    away_runs = rng.poisson(true_away).astype(np.int64)
+    ties = home_runs == away_runs
+    extras_home_win = rng.random(n_games) < _sigmoid(_EXTRA_INNINGS_SLOPE * (true_home - true_away))
+    home_runs = home_runs + (ties & extras_home_win)
+    away_runs = away_runs + (ties & ~extras_home_win)
+    margin = home_runs - away_runs
+    total_runs = home_runs + away_runs
+
+    game_seasons = (np.arange(n_games) * n_seasons // n_games).astype(np.int64)
+    sim_margin_mean = lambda_home - lambda_away + rng.normal(0.0, 0.1, n_games)
+    sim_total_mean = exp_total + rng.normal(0.0, 0.15, n_games)
+
+    features: list[FeatureMap] = []
+    sim_probs: list[float] = []
+    outcomes: list[float] = []
+    seasons: list[int] = []
+
+    for i in range(n_games):
+        shared: FeatureMap = dict.fromkeys(BASEBALL_FEATURES, None)
+        shared.update(
+            {
+                "sim_margin_mean": float(sim_margin_mean[i]),
+                "sim_total_mean": float(sim_total_mean[i]),
+                "sim_converged": 1.0,
+                "home_runs_scored_per_game": float(base_runs[i] + bat_home[i] + rng.normal(0, 0.12)),
+                "home_runs_allowed_per_game": float(base_runs[i] - pitch_home[i] + rng.normal(0, 0.12)),
+                "home_team_woba": float(0.315 + 0.020 * bat_home[i] + rng.normal(0, 0.003)),
+                "home_team_fip": float(BASEBALL_FIP_BASE - 0.9 * pitch_home[i] + rng.normal(0, 0.05)),
+                "home_bullpen_era": float(4.0 - 0.9 * pitch_home[i] + rng.normal(0, 0.30)),
+                "away_runs_scored_per_game": float(base_runs[i] + bat_away[i] + rng.normal(0, 0.12)),
+                "away_runs_allowed_per_game": float(base_runs[i] - pitch_away[i] + rng.normal(0, 0.12)),
+                "away_team_woba": float(0.315 + 0.020 * bat_away[i] + rng.normal(0, 0.003)),
+                "away_team_fip": float(BASEBALL_FIP_BASE - 0.9 * pitch_away[i] + rng.normal(0, 0.05)),
+                "away_bullpen_era": float(4.0 - 0.9 * pitch_away[i] + rng.normal(0, 0.30)),
+                "home_starter_announced": 1.0 if announced_home[i] else 0.0,
+                "away_starter_announced": 1.0 if announced_away[i] else 0.0,
+                "home_rest_days": float(home_rest[i]),
+                "away_rest_days": float(away_rest[i]),
+                "league_is_mlb": 1.0 if is_mlb[i] else 0.0,
+                "line_movement": float(rng.normal(0, 0.4)),
+                "n_books_reporting": float(rng.integers(3, 9)),
+                "line_consensus_std": float(abs(rng.normal(0.15, 0.10))),
+            }
+        )
+        home_fip = away_fip = None
+        if announced_home[i]:
+            home_fip = float(BASEBALL_FIP_BASE - 0.9 * starter_home[i] + rng.normal(0, 0.04))
+            shared["home_starter_fip"] = home_fip
+            shared["home_starter_era"] = float(home_fip + rng.normal(0, 0.30))
+            shared["home_starter_kbb"] = float(np.clip(0.145 + 0.05 * starter_home[i] + rng.normal(0, 0.01), 0.0, 0.4))
+        if announced_away[i]:
+            away_fip = float(BASEBALL_FIP_BASE - 0.9 * starter_away[i] + rng.normal(0, 0.04))
+            shared["away_starter_fip"] = away_fip
+            shared["away_starter_era"] = float(away_fip + rng.normal(0, 0.30))
+            shared["away_starter_kbb"] = float(np.clip(0.145 + 0.05 * starter_away[i] + rng.normal(0, 0.01), 0.0, 0.4))
+        if home_fip is not None and away_fip is not None:
+            shared["starter_fip_diff"] = home_fip - away_fip
+
+        market_rows = (
+            ("market_is_moneyline", float(sim_home[i]), 1.0 if margin[i] > 0 else 0.0),
+            ("market_is_spread", float(sim_cover[i]), 1.0 if margin[i] + run_lines[i] > 0 else 0.0),
+            ("market_is_total", float(sim_over[i]), 1.0 if total_runs[i] > total_lines[i] else 0.0),
+        )
+        for market_key, sim_prob, outcome in market_rows:
+            row = dict(shared)
+            row.update(
+                {
+                    "sim_probability": sim_prob,
+                    "market_is_spread": 0.0,
+                    "market_is_total": 0.0,
+                    "market_is_moneyline": 0.0,
+                }
+            )
+            row[market_key] = 1.0
+            features.append(row)
+            sim_probs.append(sim_prob)
+            outcomes.append(outcome)
+            seasons.append(int(game_seasons[i]))
+
+    return TrainingSet(
+        features=features,
+        sim_probs=np.array(sim_probs, dtype=np.float64),
+        outcomes=np.array(outcomes, dtype=np.float64),
+        seasons=np.array(seasons, dtype=np.int64),
+    )
+
+
 # Sport -> synthetic bootstrap generator. Each league wave registers its
 # sport's generator here (ADR-026); until then bootstrap fails loudly.
 SYNTHETIC_GENERATORS: dict[str, Callable[[], TrainingSet]] = {
     "BASKETBALL": generate_synthetic_dataset,
     "SOCCER": generate_soccer_synthetic_dataset,
+    "BASEBALL": generate_baseball_synthetic_dataset,
 }
 
 

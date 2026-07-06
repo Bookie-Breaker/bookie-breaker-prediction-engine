@@ -6,10 +6,11 @@ from typing import Any
 
 import pytest
 
-from prediction_engine.core.features.registry import NBA_FEATURES, SOCCER_FEATURES, get_features
+from prediction_engine.core.features.registry import BASEBALL_FEATURES, NBA_FEATURES, SOCCER_FEATURES, get_features
 from prediction_engine.core.leagues import LEAGUE_TO_SPORT, THREE_WAY_MONEYLINE_SPORTS, sport_for_league
 from prediction_engine.core.model.registry import ModelRegistry
 from prediction_engine.core.training.synthetic import (
+    generate_baseball_synthetic_dataset,
     generate_soccer_synthetic_dataset,
     generate_synthetic_dataset,
     get_synthetic_generator,
@@ -31,6 +32,29 @@ class TestFeatureRegistry:
         # no injury features for soccer (no data source; see registry comment)
         assert not any("injury" in name for name in SOCCER_FEATURES)
 
+    def test_baseball_features_registered(self) -> None:
+        assert get_features("BASEBALL") is BASEBALL_FEATURES
+        assert len(BASEBALL_FEATURES) == len(set(BASEBALL_FEATURES))
+        # the probable-starter block, announced flags, and the ADR-026
+        # pooled-league one-hot are the wave's mandatory additions
+        for required in (
+            "home_starter_fip",
+            "away_starter_fip",
+            "home_starter_era",
+            "away_starter_era",
+            "home_starter_kbb",
+            "away_starter_kbb",
+            "starter_fip_diff",
+            "home_starter_announced",
+            "away_starter_announced",
+            "league_is_mlb",
+        ):
+            assert required in BASEBALL_FEATURES
+        # baseball cannot tie: no draw features (two-way moneyline, ADR-027)
+        assert not any("draw" in name for name in BASEBALL_FEATURES)
+        # no injury features for baseball (null-documented; see registry comment)
+        assert not any("injury" in name for name in BASEBALL_FEATURES)
+
     def test_unregistered_sport_fails_loudly(self) -> None:
         with pytest.raises(ValueError, match="no feature registry for HOCKEY; added in its league wave"):
             get_features("HOCKEY")
@@ -42,6 +66,9 @@ class TestSyntheticRegistry:
 
     def test_soccer_generator_registered(self) -> None:
         assert get_synthetic_generator("SOCCER") is generate_soccer_synthetic_dataset
+
+    def test_baseball_generator_registered(self) -> None:
+        assert get_synthetic_generator("BASEBALL") is generate_baseball_synthetic_dataset
 
     def test_unregistered_sport_fails_loudly(self) -> None:
         with pytest.raises(ValueError, match="no synthetic generator registered for HOCKEY; added in its league wave"):
@@ -162,3 +189,26 @@ class TestModelRegistry:
         registry = ModelRegistry(FakeModelVersionRepo(), model_dir, sports=["BASKETBALL", "SOCCER"])  # type: ignore[arg-type]
         assert await registry.try_bootstrap() is True
         assert await registry.get_active("SOCCER", "MONEYLINE") is not None
+
+
+@pytest.fixture(scope="module")
+def baseball_model_dir(tmp_path_factory: pytest.TempPathFactory):
+    """A MODEL_DIR pre-seeded with a tiny baseball artifact (fast bootstrap)."""
+    directory = tmp_path_factory.mktemp("baseball-models")
+    result = train_model(
+        generate_baseball_synthetic_dataset(n_games=240), n_rounds=8, data_label="synthetic", sport="BASEBALL"
+    )
+    save_artifact(result, directory)
+    return directory
+
+
+class TestBaseballModelRegistry:
+    async def test_baseball_bootstrap_registers_all_markets(self, baseball_model_dir) -> None:
+        registry = ModelRegistry(FakeModelVersionRepo(), baseball_model_dir)  # type: ignore[arg-type]
+        await registry.ensure_bootstrap("BASEBALL")
+
+        for market in ("SPREAD", "TOTAL", "MONEYLINE"):
+            loaded = await registry.get_active("BASEBALL", market)
+            assert loaded is not None
+            assert loaded.record.sport == "BASEBALL"
+            assert loaded.record.feature_names == list(BASEBALL_FEATURES)
