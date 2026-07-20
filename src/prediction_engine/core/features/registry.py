@@ -328,6 +328,147 @@ NCAA_BB_FEATURES: tuple[str, ...] = (
     "line_consensus_std",
 )
 
+# --- Player-prop registries (Phase 7 Wave 3) --------------------------------
+#
+# One unified prop model per sport with the prop stat type as a one-hot
+# feature, mirroring the game models' "market type is a feature" design.
+# Stat keys are the canonical Odds API market keys, matching the
+# simulation-engine player-distributions contract exactly.
+#
+# The tuples are deliberately minimal: the simulation's P(stat over line)
+# is the baseline feature (sim_prop_probability), the line and the sim's
+# distribution mean/std give the model line-vs-rate geometry, and the
+# one-hots let it learn per-stat systematic sim biases. The game models'
+# market-signal block (line_movement / n_books_reporting /
+# line_consensus_std) is a documented exclusion: lines-service best-lines
+# serve game markets only -- there is no per-player prop line feed yet, so
+# the columns would always be None.
+#
+# side_is_over / side_is_yes: only the OVER (or YES) perspective is ever
+# fed to the model -- UNDER and NO are emitted as renormalized complements,
+# mirroring the two-way game-market logic -- so the flags encode the market
+# shape (count-line vs yes/no), not a per-row side choice.
+
+# Canonical prop stat keys per sport (= Odds API market keys).
+SOCCER_PROP_STATS: tuple[str, ...] = (
+    "player_goal_scorer_anytime",
+    "player_shots",
+    "player_shots_on_target",
+)
+BASKETBALL_PROP_STATS: tuple[str, ...] = (
+    "player_points",
+    "player_rebounds",
+    "player_assists",
+    "player_threes",
+    "player_points_rebounds_assists",
+)
+BASEBALL_PROP_STATS: tuple[str, ...] = (
+    "batter_hits",
+    "batter_total_bases",
+    "batter_home_runs",
+    "pitcher_strikeouts",
+)
+FOOTBALL_PROP_STATS: tuple[str, ...] = (
+    "player_pass_yds",
+    "player_rush_yds",
+    "player_reception_yds",
+    "player_receptions",
+    "player_anytime_td",
+)
+
+# Yes/no markets (no line; the sim reports yes_probability instead of an
+# over grid). prop_line is 0.0 for these rows.
+YES_NO_PROP_STATS: frozenset[str] = frozenset({"player_goal_scorer_anytime", "player_anytime_td"})
+
+SOCCER_PROP_FEATURES: tuple[str, ...] = (
+    # simulation-derived baseline (P(over line) or yes_probability)
+    "sim_prop_probability",
+    "prop_line",
+    "sim_stat_mean",
+    "sim_stat_std",
+    # stat one-hot (single unified prop model, stat type as a feature)
+    "prop_is_player_goal_scorer_anytime",
+    "prop_is_player_shots",
+    "prop_is_player_shots_on_target",
+    # market shape (modeled side is always OVER or YES; see module note)
+    "side_is_over",
+    "side_is_yes",
+)
+
+BASKETBALL_PROP_FEATURES: tuple[str, ...] = (
+    "sim_prop_probability",
+    "prop_line",
+    "sim_stat_mean",
+    "sim_stat_std",
+    "prop_is_player_points",
+    "prop_is_player_rebounds",
+    "prop_is_player_assists",
+    "prop_is_player_threes",
+    "prop_is_player_points_rebounds_assists",
+    "side_is_over",
+    "side_is_yes",
+)
+
+# BASEBALL and FOOTBALL prop registries ship registered but dormant this
+# wave (bootstrap-only-synthetic; no live prop line coverage yet).
+BASEBALL_PROP_FEATURES: tuple[str, ...] = (
+    "sim_prop_probability",
+    "prop_line",
+    "sim_stat_mean",
+    "sim_stat_std",
+    "prop_is_batter_hits",
+    "prop_is_batter_total_bases",
+    "prop_is_batter_home_runs",
+    "prop_is_pitcher_strikeouts",
+    "side_is_over",
+    "side_is_yes",
+)
+
+FOOTBALL_PROP_FEATURES: tuple[str, ...] = (
+    "sim_prop_probability",
+    "prop_line",
+    "sim_stat_mean",
+    "sim_stat_std",
+    "prop_is_player_pass_yds",
+    "prop_is_player_rush_yds",
+    "prop_is_player_reception_yds",
+    "prop_is_player_receptions",
+    "prop_is_player_anytime_td",
+    "side_is_over",
+    "side_is_yes",
+)
+
+PROP_STATS_BY_SPORT: dict[str, tuple[str, ...]] = {
+    "SOCCER": SOCCER_PROP_STATS,
+    "BASKETBALL": BASKETBALL_PROP_STATS,
+    "BASEBALL": BASEBALL_PROP_STATS,
+    "FOOTBALL": FOOTBALL_PROP_STATS,
+}
+
+PROP_FEATURES_BY_SPORT: dict[str, tuple[str, ...]] = {
+    "SOCCER": SOCCER_PROP_FEATURES,
+    "BASKETBALL": BASKETBALL_PROP_FEATURES,
+    "BASEBALL": BASEBALL_PROP_FEATURES,
+    "FOOTBALL": FOOTBALL_PROP_FEATURES,
+}
+
+
+def get_prop_features(sport: str) -> tuple[str, ...]:
+    """Return the ordered prop feature tuple for a sport."""
+    try:
+        return PROP_FEATURES_BY_SPORT[sport]
+    except KeyError:
+        raise ValueError(f"no player-prop feature registry for {sport}; added in its prop wave") from None
+
+
+def get_prop_stats(sport: str) -> tuple[str, ...]:
+    """Return the canonical prop stat keys for a sport."""
+    try:
+        return PROP_STATS_BY_SPORT[sport]
+    except KeyError:
+        raise ValueError(f"no player-prop stat registry for {sport}; added in its prop wave") from None
+
+
 FeatureMap = dict[str, float | None]
 
 # Model key -> ordered feature tuple. Keys are sports for pooled models and

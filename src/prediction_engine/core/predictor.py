@@ -27,13 +27,13 @@ from prediction_engine.api.schemas import (
 )
 from prediction_engine.clients.lines import BestLine, LinesClient
 from prediction_engine.clients.reconcile import GameReconciler
-from prediction_engine.clients.simulation import SimulationClient, SimulationRun
+from prediction_engine.clients.simulation import PlayerStatSimulation, SimulationClient, SimulationRun
 from prediction_engine.clients.statistics import Game, StatisticsClient
 from prediction_engine.core.edges import edge_percentage
 from prediction_engine.core.features.builder import FeatureBuilder
-from prediction_engine.core.features.registry import FeatureMap
+from prediction_engine.core.features.registry import FeatureMap, get_prop_stats
 from prediction_engine.core.leagues import THREE_WAY_MONEYLINE_SPORTS, model_key_for_league, sport_for_league
-from prediction_engine.core.model.registry import ModelRegistry
+from prediction_engine.core.model.registry import PROP_MODEL_TYPE, LoadedModel, ModelRegistry
 from prediction_engine.db.repository import PredictionRecord, PredictionRepository
 from prediction_engine.events.publisher import publish_prediction_completed
 
@@ -172,6 +172,153 @@ class Predictor:
         line, sim_prob = _interpolate(result.total_over_probabilities, target)
         return [_RowInputs("OVER", f"Over {line:g}", sim_prob, implied("OVER"))]
 
+    def _calibrated_prop(
+        self, loaded: LoadedModel, features: FeatureMap, sim_probability: float
+    ) -> tuple[float, float, float, dict[str, float]]:
+        """Adjustment -> Platt -> conformal for the modeled prop side.
+
+        Returns (predicted, lower, upper, feature_importance).
+        """
+        adjustment = loaded.bundle.model.predict_adjustment(features)
+        raw = float(np.clip(sim_probability + adjustment, 0.01, 0.99))
+        predicted = round(loaded.bundle.calibrator.apply(raw), 5)
+        lower, upper = loaded.bundle.conformal.interval(predicted)
+        return predicted, lower, upper, loaded.bundle.model.feature_importance(features)
+
+    def _prop_feature_map(
+        self,
+        stat_names: tuple[str, ...],
+        stat_type: str,
+        sim_probability: float,
+        line: float,
+        is_yes: bool,
+        stat: PlayerStatSimulation,
+    ) -> FeatureMap:
+        """Prop feature vector for the modeled (OVER or YES) perspective."""
+        features: FeatureMap = {
+            "sim_prop_probability": sim_probability,
+            "prop_line": line,
+            "sim_stat_mean": stat.distribution.get("mean"),
+            "sim_stat_std": stat.distribution.get("std"),
+            "side_is_over": 0.0 if is_yes else 1.0,
+            "side_is_yes": 1.0 if is_yes else 0.0,
+        }
+        for name in stat_names:
+            features[f"prop_is_{name}"] = 1.0 if name == stat_type else 0.0
+        return features
+
+    async def _prop_rows(self, request: PredictionRequest, game: Game, model_key: str) -> list[dict[str, Any]]:
+        """PLAYER_PROP prediction-row dicts for the requested props (Wave 3).
+
+        The model only ever sees the OVER (or YES) perspective; UNDER and NO
+        rows are emitted as renormalized complements of the calibrated
+        probability, mirroring the two-way game-market logic. All
+        contract violations (no player capture, unknown player/stat, a line
+        off the sim's half-step grid) surface as 422s.
+        """
+        try:
+            loaded = await self._registry.get_active(model_key, PROP_MODEL_TYPE)
+        except ValueError as exc:  # sport has no prop registry yet (later prop wave)
+            raise UnprocessableError(str(exc)) from exc
+        if loaded is None:
+            raise UnprocessableError(f"No active {PROP_MODEL_TYPE} model for {model_key}")
+        try:
+            distributions = await self._simulation.get_player_distributions(request.simulation_run_id)
+        except NotFoundError as exc:
+            raise UnprocessableError(
+                f"Simulation run {request.simulation_run_id} has no player distributions; "
+                "rerun the simulation with player capture enabled"
+            ) from exc
+        stat_names = get_prop_stats(model_key)
+
+        rows: list[dict[str, Any]] = []
+        for prop in request.props:
+            player = distributions.players.get(prop.player_external_id)
+            if player is None:
+                raise UnprocessableError(
+                    f"Player {prop.player_external_id} is not in simulation run {request.simulation_run_id}"
+                )
+            if prop.stat_type not in stat_names:
+                raise UnprocessableError(f"{prop.stat_type} is not a registered {model_key} prop stat")
+            stat = player.stats.get(prop.stat_type)
+            if stat is None:
+                raise UnprocessableError(
+                    f"Simulation run {request.simulation_run_id} has no {prop.stat_type} distribution "
+                    f"for player {prop.player_external_id}"
+                )
+            player_name = prop.player_name or player.name or prop.player_external_id
+            shared = {
+                "game_external_id": request.game_id,
+                "model_version_id": loaded.record.id,
+                "league": game.league,
+                "market_type": PROP_MODEL_TYPE,
+                "implied_probability": None,  # no per-player prop line feed from lines-service yet
+                "edge": None,
+                "player_external_id": prop.player_external_id,
+                "stat_type": prop.stat_type,
+            }
+
+            if stat.yes_probability is not None:
+                if prop.side in ("OVER", "UNDER"):
+                    raise UnprocessableError(f"{prop.stat_type} is a yes/no prop; side must be YES, NO, or omitted")
+                sim_yes = float(stat.yes_probability)
+                features = self._prop_feature_map(stat_names, prop.stat_type, sim_yes, 0.0, True, stat)
+                predicted, lower, upper, importance = self._calibrated_prop(loaded, features, sim_yes)
+                sides = [prop.side] if prop.side is not None else ["YES"]
+                for side in sides:
+                    yes_side = side == "YES"
+                    rows.append(
+                        {
+                            **shared,
+                            "side": side,
+                            "selection": f"{player_name} {prop.stat_type} {'Yes' if yes_side else 'No'}",
+                            "predicted_probability": predicted if yes_side else round(1.0 - predicted, 5),
+                            "simulation_probability": round(sim_yes if yes_side else 1.0 - sim_yes, 5),
+                            "confidence_lower": lower if yes_side else round(1.0 - upper, 5),
+                            "confidence_upper": upper if yes_side else round(1.0 - lower, 5),
+                            "feature_importance": importance,
+                            "prop_line": None,
+                        }
+                    )
+                continue
+
+            if prop.side in ("YES", "NO"):
+                raise UnprocessableError(
+                    f"{prop.stat_type} is an over/under prop; side must be OVER, UNDER, or omitted"
+                )
+            if prop.line is None:
+                raise UnprocessableError(f"line is required for {prop.stat_type}")
+            # v1 requires an exact half-step grid match; interpolation off
+            # the grid is deferred until real prop calibration data exists.
+            sim_over = next(
+                (value for key, value in stat.over_probabilities.items() if abs(float(key) - prop.line) < 1e-9),
+                None,
+            )
+            if sim_over is None:
+                raise UnprocessableError(
+                    f"line {prop.line:g} is outside the simulated {prop.stat_type} grid "
+                    f"({sorted(stat.over_probabilities)}) for player {prop.player_external_id}"
+                )
+            features = self._prop_feature_map(stat_names, prop.stat_type, float(sim_over), prop.line, False, stat)
+            predicted, lower, upper, importance = self._calibrated_prop(loaded, features, float(sim_over))
+            sides = [prop.side] if prop.side is not None else ["OVER", "UNDER"]
+            for side in sides:
+                over_side = side == "OVER"
+                rows.append(
+                    {
+                        **shared,
+                        "side": side,
+                        "selection": f"{player_name} {prop.stat_type} {'Over' if over_side else 'Under'} {prop.line:g}",
+                        "predicted_probability": predicted if over_side else round(1.0 - predicted, 5),
+                        "simulation_probability": round(float(sim_over) if over_side else 1.0 - float(sim_over), 5),
+                        "confidence_lower": lower if over_side else round(1.0 - upper, 5),
+                        "confidence_upper": upper if over_side else round(1.0 - lower, 5),
+                        "feature_importance": importance,
+                        "prop_line": prop.line,
+                    }
+                )
+        return rows
+
     async def create_predictions(
         self, request: PredictionRequest, idempotency_key: str | None = None
     ) -> PredictionGroupData:
@@ -264,6 +411,9 @@ class Predictor:
                     }
                 )
 
+        if request.props:
+            rows.extend(await self._prop_rows(request, game, model_key))
+
         records = await self._repo.insert_predictions(
             rows,
             features={k: v for k, v in bundle.features.items()},
@@ -271,12 +421,13 @@ class Predictor:
         )
 
         edges_found = sum(1 for r in records if r.edge is not None and r.edge > 0)
+        event_markets = list(request.market_types) + ([PROP_MODEL_TYPE] if request.props else [])
         await publish_prediction_completed(
             self._redis,
             batch_id=str(uuid.uuid4()),
             game_ids=[request.game_id],
             league=game.league,
-            market_types=list(request.market_types),
+            market_types=event_markets,
             predictions_count=len(records),
             edges_found=edges_found,
         )
@@ -348,4 +499,7 @@ def _to_item(record: PredictionRecord) -> PredictionItem:
         model_version_id=str(record.model_version_id),
         feature_importance=record.feature_importance,
         created_at=record.created_at.isoformat().replace("+00:00", "Z"),
+        player_external_id=record.player_external_id,
+        stat_type=record.stat_type,
+        prop_line=record.prop_line,
     )

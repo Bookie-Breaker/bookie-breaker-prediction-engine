@@ -45,6 +45,10 @@ class PredictionRecord:
     confidence_upper: float | None
     feature_importance: dict[str, float]
     created_at: datetime
+    # Player-prop rows only (Phase 7 Wave 3); None on game-market rows.
+    player_external_id: str | None = None
+    stat_type: str | None = None
+    prop_line: float | None = None
 
 
 def _model_version_from_row(row: Row[Any]) -> ModelVersionRecord:
@@ -81,6 +85,9 @@ def _prediction_from_row(row: Row[Any]) -> PredictionRecord:
         confidence_upper=float(row.confidence_upper) if row.confidence_upper is not None else None,
         feature_importance=dict(row.feature_importance),
         created_at=row.created_at,
+        player_external_id=row.player_external_id,
+        stat_type=row.stat_type,
+        prop_line=float(row.prop_line) if row.prop_line is not None else None,
     )
 
 
@@ -222,18 +229,34 @@ class PredictionRepository:
         market_types: list[str] | None = None,
         model_version_id: uuid.UUID | None = None,
     ) -> list[PredictionRecord]:
-        """Most recent prediction per (market type, side) for a game.
+        """Most recent prediction per (market type, side, prop identity) for a game.
 
         Side is part of the distinct key so three-way moneyline batches
         (HOME/DRAW/AWAY rows sharing one market type, ADR-027) are returned
         in full; two-way markets emit exactly one side per batch, so their
-        behavior is unchanged.
+        behavior is unchanged. The player-prop columns (Phase 7 Wave 3)
+        extend the key so distinct players/stats/lines each keep their
+        latest row; they are NULL on game-market rows (DISTINCT ON treats
+        NULLs as equal), leaving game-market behavior unchanged.
         """
         stmt = (
             select(predictions)
             .where(predictions.c.game_external_id == game_external_id)
-            .order_by(predictions.c.market_type, predictions.c.side, predictions.c.created_at.desc())
-            .distinct(predictions.c.market_type, predictions.c.side)
+            .order_by(
+                predictions.c.market_type,
+                predictions.c.side,
+                predictions.c.player_external_id,
+                predictions.c.stat_type,
+                predictions.c.prop_line,
+                predictions.c.created_at.desc(),
+            )
+            .distinct(
+                predictions.c.market_type,
+                predictions.c.side,
+                predictions.c.player_external_id,
+                predictions.c.stat_type,
+                predictions.c.prop_line,
+            )
         )
         if market_types:
             stmt = stmt.where(predictions.c.market_type.in_(market_types))

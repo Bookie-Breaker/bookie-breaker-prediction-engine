@@ -19,7 +19,7 @@ import xgboost as xgb
 
 from prediction_engine.core.calibration import PlattCalibrator
 from prediction_engine.core.conformal import SplitConformal
-from prediction_engine.core.features.registry import get_features
+from prediction_engine.core.features.registry import get_features, get_prop_features
 from prediction_engine.core.model.artifact import ArtifactBundle
 from prediction_engine.core.model.xgb import AdjustmentModel
 from prediction_engine.core.training.dataset import TrainingSet
@@ -63,8 +63,17 @@ def train_model(
     params: dict[str, Any] | None = None,
     data_label: str = "synthetic",
     sport: str = "BASKETBALL",
+    market: str = "GAME",
 ) -> TrainingResult:
-    feature_names = list(get_features(sport))
+    """Train the adjustment model for a sport.
+
+    market selects the model family: "GAME" (default, the unified
+    SPREAD/TOTAL/MONEYLINE model) or "PLAYER_PROP" (the unified prop model,
+    Phase 7 Wave 3), which uses the prop feature registry and saves under
+    the "props" artifact family.
+    """
+    is_prop = market == "PLAYER_PROP"
+    feature_names = list(get_prop_features(sport)) if is_prop else list(get_features(sport))
     params = {**DEFAULT_XGB_PARAMS, **(params or {})}
 
     last_season = int(dataset.seasons.max())
@@ -126,10 +135,12 @@ def train_model(
     trained_at = datetime.now(tz=UTC)
     content_hash = hashlib.sha256(json.dumps(metrics, sort_keys=True).encode()).hexdigest()[:8]
     tag_prefix = _VERSION_TAG_PREFIX.get(sport, sport)
-    version_tag = f"{tag_prefix}_unified_{trained_at:%Y%m%d}_{content_hash}"
+    family = "props" if is_prop else "unified"
+    version_tag = f"{tag_prefix}_{family}_{trained_at:%Y%m%d}_{content_hash}"
     metadata = {
         "version_tag": version_tag,
         "sport": sport,
+        "family": family,
         "algorithm": "xgboost",
         "data_label": data_label,
         "feature_names": feature_names,
@@ -148,6 +159,7 @@ def train_model(
 
 def save_artifact(result: TrainingResult, model_dir: Path) -> Path:
     sport = str(result.bundle.metadata.get("sport", "BASKETBALL"))
-    directory = model_dir / sport.lower() / "unified" / result.bundle.version_tag
+    family = str(result.bundle.metadata.get("family", "unified"))
+    directory = model_dir / sport.lower() / family / result.bundle.version_tag
     result.bundle.save(directory)
     return directory

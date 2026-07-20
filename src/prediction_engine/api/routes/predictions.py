@@ -66,6 +66,9 @@ async def get_prediction(
                 feature_source_versions=sources,
             ),
             created_at=item.created_at,
+            player_external_id=item.player_external_id,
+            stat_type=item.stat_type,
+            prop_line=item.prop_line,
         )
     )
 

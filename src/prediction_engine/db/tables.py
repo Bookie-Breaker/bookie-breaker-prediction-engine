@@ -85,6 +85,11 @@ predictions = Table(
     Column("market_type", _enum("market_type_enum"), nullable=False),
     # Nullable: rows created before Phase 6 predate the side vocabulary (ADR-027)
     Column("side", Text),
+    # Player-prop rows only (Phase 7 Wave 3, market_type = PLAYER_PROP);
+    # NULL on game-market rows. prop_line stays NULL for yes/no props.
+    Column("player_external_id", Text),
+    Column("stat_type", Text),
+    Column("prop_line", Numeric(8, 2)),
     Column("selection", Text, nullable=False),
     Column("predicted_probability", Numeric(6, 5), nullable=False),
     Column("simulation_probability", Numeric(6, 5)),
@@ -103,7 +108,7 @@ predictions = Table(
         name="chk_predictions_confidence_range",
     ),
     CheckConstraint(
-        "side IN ('HOME', 'AWAY', 'DRAW', 'OVER', 'UNDER')",
+        "side IN ('HOME', 'AWAY', 'DRAW', 'OVER', 'UNDER', 'YES', 'NO')",
         name="chk_predictions_side",
     ),
     Index("idx_predictions_game_market", "game_external_id", "market_type", text("created_at DESC")),
