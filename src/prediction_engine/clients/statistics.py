@@ -34,6 +34,24 @@ class ProbablePitcher(BaseModel):
     innings_pitched: float | None = None
 
 
+class GameResult(BaseModel):
+    """Final result block for FINAL games (Phase 7 Wave 4: outcome joins).
+
+    regulation_*_score are the 90-minute scores, populated only for soccer
+    matches that went to extra time; soccer markets settle on these
+    (ADR-027).
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    home_score: int
+    away_score: int
+    overtime: bool = False
+    regulation_home_score: int | None = None
+    regulation_away_score: int | None = None
+    completed_at: str = ""
+
+
 class Game(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -47,6 +65,10 @@ class Game(BaseModel):
     season_type: str = ""
     home_probable_pitcher: ProbablePitcher | None = None
     away_probable_pitcher: ProbablePitcher | None = None
+    # Present once the game is FINAL (Phase 7 Wave 4: retraining/experiments)
+    home_score: int | None = None
+    away_score: int | None = None
+    result: GameResult | None = None
 
 
 class OffensiveStats(BaseModel):

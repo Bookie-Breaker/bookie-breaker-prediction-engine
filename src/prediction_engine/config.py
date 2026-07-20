@@ -24,6 +24,15 @@ class Settings(BaseSettings):
     idempotency_ttl_seconds: int = 86_400  # 24h per api-contracts README
     game_map_ttl_seconds: int = 86_400  # statistics<->lines game id mapping cache
 
+    # Champion/challenger serving (Phase 7 Wave 4)
+    shadow_scoring_enabled: bool = True  # zero-risk: shadow rows never reach read paths
+    # Deterministic % of games served by the active challenger (champion
+    # becomes the shadow row). 0 = shadow-only. Raising this begins real
+    # bankroll exposure to the challenger -- operator decision.
+    ab_split_pct: int = 0
+    promotion_min_samples: int = 300  # graded shadow pairs required to promote
+    retrain_status_ttl_seconds: int = 86_400  # pred:retrain:{job_id} status keys
+
     otel_exporter_otlp_endpoint: str | None = None
     otel_service_name: str = "prediction-engine"
 

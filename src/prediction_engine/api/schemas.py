@@ -72,6 +72,10 @@ class PredictionItem(BaseModel):
     player_external_id: str | None = None
     stat_type: str | None = None
     prop_line: float | None = None
+    # True on shadow-scored challenger rows (Phase 7 Wave 4); POST
+    # responses and read paths only surface primary rows, but a direct GET
+    # by id can return one.
+    is_shadow: bool = False
 
 
 class PredictionGroupData(BaseModel):
@@ -107,6 +111,7 @@ class PredictionDetailData(BaseModel):
     player_external_id: str | None = None
     stat_type: str | None = None
     prop_line: float | None = None
+    is_shadow: bool = False
 
 
 class LatestPredictionsData(BaseModel):
@@ -141,32 +146,72 @@ class ModelVersionData(BaseModel):
     evaluation_metrics: dict[str, float]
     is_active: bool
     notes: str | None = None
+    role: str = "champion"
 
 
 class ModelVersionDetailData(ModelVersionData):
     feature_names: list[str]
 
 
-class RetrainConfig(BaseModel):
-    min_samples: int = 1000
-    test_split: float = Field(default=0.2, gt=0.0, lt=1.0)
-    date_from: str | None = None
-    date_to: str | None = None
-
-
 class RetrainRequest(BaseModel):
+    """Real retraining request (Phase 7 Wave 4).
+
+    v1 covers game markets only; market="player_prop" 422s with the
+    documented deferral (props settle against box scores, not joined yet).
+    """
+
     sport: str
-    market_type: str
-    training_config: RetrainConfig = RetrainConfig()
+    market: Literal["game", "player_prop"] = "game"
+    ensemble: bool = Field(default=False, description="Train the GBT+RF ensemble instead of the single GBT.")
+    min_rows: int = Field(default=200, ge=1, description="Minimum assembled training rows to proceed.")
 
 
-class RetrainData(BaseModel):
-    retrain_id: str
+class RetrainAcceptedData(BaseModel):
+    job_id: str
+    sport: str
+    status: str = "queued"
+
+
+class RetrainStatusData(BaseModel):
+    job_id: str
+    status: str  # queued | assembling | training | registered | failed | insufficient_data
+    sport: str | None = None
+    detail: str | None = None
+    rows: int | None = None
+    model_version_id: str | None = None
+    ensemble: bool | None = None
+    updated_at: str | None = None
+
+
+class ExperimentModelData(BaseModel):
+    model_version_id: str
+    version_tag: str
+    role: str
+    brier_score: float | None = None
+    log_loss: float | None = None
+    calibration_error: float | None = None
+
+
+class ExperimentData(BaseModel):
     sport: str
     market_type: str
-    status: str
-    started_at: str
-    estimated_duration_minutes: int
+    graded_pairs: int
+    champion: ExperimentModelData
+    challenger: ExperimentModelData
+    promotion_ready: bool
+    blockers: list[str]
+
+
+class PromoteRequest(BaseModel):
+    force: bool = Field(default=False, description="Promote even when the criteria are not met.")
+
+
+class PromotionData(BaseModel):
+    sport: str
+    market_type: str
+    promoted_version: str
+    model_version_ids: list[str]
+    forced: bool
 
 
 class HealthData(BaseModel):

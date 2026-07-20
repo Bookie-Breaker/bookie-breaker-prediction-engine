@@ -164,9 +164,17 @@ class TestModelsAndHealth:
         assert detail.json()["data"]["feature_names"][0] == "sim_probability"
 
     def test_retrain_accepted(self, client) -> None:
-        response = client.post("/api/v1/predict/models/retrain", json={"sport": "BASKETBALL", "market_type": "SPREAD"})
+        # Wave 4: the stub became a real background job returning a job id;
+        # with no seeded graded history the job lands on insufficient_data.
+        response = client.post(
+            "/api/v1/predict/models/retrain",
+            json={"sport": "BASKETBALL", "market": "game", "min_rows": 999999},
+        )
         assert response.status_code == 202
-        assert response.json()["data"]["status"] == "started"
+        job_id = response.json()["data"]["job_id"]
+        status = client.get(f"/api/v1/predict/models/retrain/{job_id}")
+        assert status.status_code == 200
+        assert status.json()["data"]["status"] in {"queued", "assembling", "insufficient_data"}
 
     def test_health_lists_active_models(self, client, upstream) -> None:
         from httpx import Response

@@ -106,6 +106,11 @@ def main() -> None:
     source.add_argument("--data", type=Path, help="Parquet file from a scripts/collect_*_data.py run")
     parser.add_argument("--out", type=Path, default=Path("./models"), help="MODEL_DIR to write the artifact into")
     parser.add_argument("--rounds", type=int, default=200, help="Boosting rounds")
+    parser.add_argument(
+        "--ensemble",
+        action="store_true",
+        help="Train the GBT + XGBoost-random-forest ensemble (Phase 7 Wave 4) instead of the single GBT",
+    )
     parser.add_argument("--register-db", metavar="DATABASE_URL", help="Register + activate in this database")
     args = parser.parse_args()
 
@@ -119,7 +124,9 @@ def main() -> None:
     label = "synthetic" if args.synthetic else f"real:{args.data.name}"
 
     started = datetime.now(tz=UTC)
-    result = train_model(dataset, n_rounds=args.rounds, data_label=label, sport=args.sport, market=market)
+    result = train_model(
+        dataset, n_rounds=args.rounds, data_label=label, sport=args.sport, market=market, ensemble=args.ensemble
+    )
     artifact_dir = save_artifact(result, args.out)
     elapsed = (datetime.now(tz=UTC) - started).total_seconds()
 
