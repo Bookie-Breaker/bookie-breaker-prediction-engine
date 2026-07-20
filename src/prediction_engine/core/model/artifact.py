@@ -5,6 +5,10 @@ mean inference needs neither sklearn nor version-pinned deserialization.
 Layout: $MODEL_DIR/{sport_lowercase}/{family}/<version_tag>/ where family is
 "unified" for the game-market models and "props" for the player-prop models
 (Phase 7 Wave 3).
+
+Ensemble artifacts (Phase 7 Wave 4) extend the layout with model_rf.ubj and
+blend.json alongside the primary model.ubj; a directory without blend.json
+loads exactly as before, so every previously deployed artifact stays valid.
 """
 
 import json
@@ -14,6 +18,7 @@ from typing import Any
 
 from prediction_engine.core.calibration import PlattCalibrator
 from prediction_engine.core.conformal import SplitConformal
+from prediction_engine.core.model.ensemble import BLEND_FILENAME, EnsembleAdjustmentModel
 from prediction_engine.core.model.xgb import AdjustmentModel
 
 MODEL_FILENAME = "model.ubj"
@@ -24,7 +29,7 @@ METADATA_FILENAME = "metadata.json"
 
 @dataclass
 class ArtifactBundle:
-    model: AdjustmentModel
+    model: AdjustmentModel | EnsembleAdjustmentModel
     calibrator: PlattCalibrator
     conformal: SplitConformal
     metadata: dict[str, Any]
@@ -39,7 +44,10 @@ class ArtifactBundle:
 
     def save(self, directory: Path) -> None:
         directory.mkdir(parents=True, exist_ok=True)
-        self.model.save(directory / MODEL_FILENAME)
+        if isinstance(self.model, EnsembleAdjustmentModel):
+            self.model.save_members(directory)
+        else:
+            self.model.save(directory / MODEL_FILENAME)
         (directory / CALIBRATION_FILENAME).write_text(
             json.dumps({"method": "platt", "a": self.calibrator.a, "b": self.calibrator.b})
         )
@@ -54,8 +62,13 @@ class ArtifactBundle:
         feature_names = [str(name) for name in metadata["feature_names"]]
         calibration = json.loads((directory / CALIBRATION_FILENAME).read_text())
         conformal = json.loads((directory / CONFORMAL_FILENAME).read_text())
+        model: AdjustmentModel | EnsembleAdjustmentModel
+        if (directory / BLEND_FILENAME).is_file():
+            model = EnsembleAdjustmentModel.load(directory, feature_names)
+        else:
+            model = AdjustmentModel.load(directory / MODEL_FILENAME, feature_names)
         return cls(
-            model=AdjustmentModel.load(directory / MODEL_FILENAME, feature_names),
+            model=model,
             calibrator=PlattCalibrator(a=float(calibration["a"]), b=float(calibration["b"])),
             conformal=SplitConformal(half_width=float(conformal["half_width"]), alpha=float(conformal["alpha"])),
             metadata=metadata,

@@ -19,6 +19,12 @@ model_versions row with model_type PLAYER_PROP, keyed (sport,
 "PLAYER_PROP") in the active map. Prop artifacts live under
 models/{sport}/props/ and bootstrap lazily on the first prop request
 (ensure_prop_bootstrap), not at startup.
+
+Champion/challenger (Phase 7 Wave 4): the in-memory map is keyed
+(sport, market_type, role). Champions are the default serve path -- every
+pre-Wave-4 accessor keeps its signature and behavior. Challengers never
+bootstrap synthetically: get_challenger returns None when no active
+challenger row exists (absence simply means no experiment is running).
 """
 
 import asyncio
@@ -48,7 +54,7 @@ class ModelRegistry:
         self._repo = repo
         self._model_dir = model_dir
         self._sports = list(sports) if sports is not None else ["BASKETBALL"]
-        self._active: dict[tuple[str, str], LoadedModel] = {}
+        self._active: dict[tuple[str, str, str], LoadedModel] = {}
         self._bootstrap_lock = asyncio.Lock()
 
     async def try_bootstrap(self) -> bool:
@@ -68,21 +74,54 @@ class ModelRegistry:
         return ok
 
     async def get_active(self, sport: str, market_type: str) -> LoadedModel | None:
+        """The champion model for (sport, market_type), bootstrapping if needed."""
         if market_type == PROP_MODEL_TYPE:
-            if (sport, PROP_MODEL_TYPE) not in self._active:
+            if (sport, PROP_MODEL_TYPE, "champion") not in self._active:
                 async with self._bootstrap_lock:
-                    if (sport, PROP_MODEL_TYPE) not in self._active:
+                    if (sport, PROP_MODEL_TYPE, "champion") not in self._active:
                         await self.ensure_prop_bootstrap(sport)
-            return self._active.get((sport, PROP_MODEL_TYPE))
+            return self._active.get((sport, PROP_MODEL_TYPE, "champion"))
         if not self._has_sport(sport):
             async with self._bootstrap_lock:
                 if not self._has_sport(sport):
                     await self.ensure_bootstrap(sport)
-        return self._active.get((sport, market_type))
+        return self._active.get((sport, market_type, "champion"))
+
+    async def get_challenger(self, sport: str, market_type: str) -> LoadedModel | None:
+        """The active challenger for (sport, market_type), or None.
+
+        Challengers lazy-load from the database on every call (a retrain
+        job may register one at any time) but their artifact bundle is
+        cached and reused while the active row's id is unchanged. There is
+        no synthetic bootstrap for challengers: no active row means no
+        experiment is running.
+        """
+        record = await self._repo.get_active(sport, market_type, role="challenger")
+        key = (sport, market_type, "challenger")
+        if record is None:
+            self._active.pop(key, None)
+            return None
+        cached = self._active.get(key)
+        if cached is not None and cached.record.id == record.id:
+            return cached
+        loaded = LoadedModel(record=record, bundle=ArtifactBundle.load(Path(record.artifact_path)))
+        self._active[key] = loaded
+        return loaded
+
+    async def reload_sport(self, sport: str) -> None:
+        """Drop every cached model for a sport and reload its active rows.
+
+        Called after promotion so the in-memory map reflects the flipped
+        roles immediately.
+        """
+        for key in [key for key in self._active if key[0] == sport]:
+            del self._active[key]
+        records = await self._repo.list_models(sport=sport, is_active=True)
+        await self._load_active(records)
 
     def _has_sport(self, sport: str) -> bool:
-        """Whether the sport's game-market models are loaded (props are keyed separately)."""
-        return any(key[0] == sport and key[1] in MARKET_TYPES for key in self._active)
+        """Whether the sport's game-market champions are loaded (props are keyed separately)."""
+        return any(key[0] == sport and key[1] in MARKET_TYPES and key[2] == "champion" for key in self._active)
 
     async def ensure_bootstrap(self, sport: str) -> None:
         # Prop rows share the sport but bootstrap separately, so the game
@@ -159,12 +198,21 @@ class ModelRegistry:
         for record in records:
             if record.artifact_path not in bundles:
                 bundles[record.artifact_path] = ArtifactBundle.load(Path(record.artifact_path))
-            self._active[(record.sport, record.model_type)] = LoadedModel(
+            self._active[(record.sport, record.model_type, record.role)] = LoadedModel(
                 record=record, bundle=bundles[record.artifact_path]
             )
 
     def active_for(self, sport: str, market_type: str) -> LoadedModel | None:
-        return self._active.get((sport, market_type))
+        return self._active.get((sport, market_type, "champion"))
 
     def active_map(self) -> dict[str, str]:
-        return {f"{sport}_{market}": str(model.record.id) for (sport, market), model in self._active.items()}
+        """Loaded models by "{sport}_{market}" key; non-champion roles get a role suffix.
+
+        Champion keys keep their pre-Wave-4 shape so health consumers are
+        unaffected by the role dimension.
+        """
+        result: dict[str, str] = {}
+        for (sport, market, role), model in self._active.items():
+            key = f"{sport}_{market}" if role == "champion" else f"{sport}_{market}_{role}"
+            result[key] = str(model.record.id)
+        return result

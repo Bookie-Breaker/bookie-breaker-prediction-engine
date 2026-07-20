@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import Row, insert, select, update
+from sqlalchemy import Row, Select, insert, select, update
 from sqlalchemy.dialects.postgresql import Range
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
@@ -26,6 +26,8 @@ class ModelVersionRecord:
     is_active: bool
     artifact_path: str
     notes: str | None
+    # Serving role (Phase 7 Wave 4): champion | challenger | shadow.
+    role: str = "champion"
 
 
 @dataclass(frozen=True)
@@ -49,6 +51,8 @@ class PredictionRecord:
     player_external_id: str | None = None
     stat_type: str | None = None
     prop_line: float | None = None
+    # Shadow-scored challenger rows (Phase 7 Wave 4).
+    is_shadow: bool = False
 
 
 def _model_version_from_row(row: Row[Any]) -> ModelVersionRecord:
@@ -65,6 +69,7 @@ def _model_version_from_row(row: Row[Any]) -> ModelVersionRecord:
         is_active=row.is_active,
         artifact_path=row.artifact_path,
         notes=row.notes,
+        role=row.role,
     )
 
 
@@ -88,7 +93,43 @@ def _prediction_from_row(row: Row[Any]) -> PredictionRecord:
         player_external_id=row.player_external_id,
         stat_type=row.stat_type,
         prop_line=float(row.prop_line) if row.prop_line is not None else None,
+        is_shadow=row.is_shadow,
     )
+
+
+def _latest_for_game_stmt(
+    game_external_id: str,
+    market_types: list[str] | None,
+    model_version_id: uuid.UUID | None,
+    include_shadow: bool,
+) -> Select[Any]:
+    """Build the latest-per-key query (module-level so the shadow filter is unit-testable)."""
+    stmt = (
+        select(predictions)
+        .where(predictions.c.game_external_id == game_external_id)
+        .order_by(
+            predictions.c.market_type,
+            predictions.c.side,
+            predictions.c.player_external_id,
+            predictions.c.stat_type,
+            predictions.c.prop_line,
+            predictions.c.created_at.desc(),
+        )
+        .distinct(
+            predictions.c.market_type,
+            predictions.c.side,
+            predictions.c.player_external_id,
+            predictions.c.stat_type,
+            predictions.c.prop_line,
+        )
+    )
+    if not include_shadow:
+        stmt = stmt.where(predictions.c.is_shadow == False)  # noqa: E712
+    if market_types:
+        stmt = stmt.where(predictions.c.market_type.in_(market_types))
+    if model_version_id is not None:
+        stmt = stmt.where(predictions.c.model_version_id == model_version_id)
+    return stmt
 
 
 class ModelVersionRepository:
@@ -100,6 +141,7 @@ class ModelVersionRepository:
         sport: str | None = None,
         market_type: str | None = None,
         is_active: bool | None = None,
+        role: str | None = None,
     ) -> list[ModelVersionRecord]:
         stmt = select(model_versions).order_by(model_versions.c.created_at.desc())
         if sport is not None:
@@ -108,9 +150,27 @@ class ModelVersionRepository:
             stmt = stmt.where(model_versions.c.model_type == market_type)
         if is_active is not None:
             stmt = stmt.where(model_versions.c.is_active == is_active)
+        if role is not None:
+            stmt = stmt.where(model_versions.c.role == role)
         async with self._engine.connect() as conn:
             rows = (await conn.execute(stmt)).fetchall()
         return [_model_version_from_row(row) for row in rows]
+
+    async def get_active(self, sport: str, market_type: str, role: str = "champion") -> ModelVersionRecord | None:
+        """The single active row for (sport, market_type, role), if any.
+
+        Uniqueness is guaranteed by the uq_model_versions_active partial
+        index (one active row per sport/model_type/role).
+        """
+        stmt = select(model_versions).where(
+            model_versions.c.sport == sport,
+            model_versions.c.model_type == market_type,
+            model_versions.c.role == role,
+            model_versions.c.is_active == True,  # noqa: E712
+        )
+        async with self._engine.connect() as conn:
+            row = (await conn.execute(stmt)).one_or_none()
+        return _model_version_from_row(row) if row is not None else None
 
     async def get(self, model_id: uuid.UUID) -> ModelVersionRecord | None:
         stmt = select(model_versions).where(model_versions.c.id == model_id)
@@ -134,14 +194,16 @@ class ModelVersionRepository:
         artifact_path: str,
         notes: str | None = None,
         activate: bool = True,
+        role: str = "champion",
     ) -> list[ModelVersionRecord]:
         """Register one row per market type sharing a single artifact.
 
         The unified model covers all market types (market type is a feature),
         so SPREAD/TOTAL/MONEYLINE rows share artifact_path. When activating,
-        previous active rows for the same (sport, market_type) are
+        previous active rows for the same (sport, market_type, role) are
         deactivated in the same transaction to satisfy the partial unique
-        index.
+        index; other roles' active rows are untouched, so registering a
+        challenger never displaces the champion.
         """
         records: list[ModelVersionRecord] = []
         async with self._engine.begin() as conn:
@@ -152,6 +214,7 @@ class ModelVersionRepository:
                         .where(
                             model_versions.c.sport == sport,
                             model_versions.c.model_type == market_type,
+                            model_versions.c.role == role,
                             model_versions.c.is_active == True,  # noqa: E712
                         )
                         .values(is_active=False)
@@ -171,11 +234,56 @@ class ModelVersionRepository:
                         is_active=activate,
                         artifact_path=artifact_path,
                         notes=notes,
+                        role=role,
                     )
                     .returning(model_versions)
                 )
                 records.append(_model_version_from_row(result.one()))
         return records
+
+    async def promote(self, sport: str, market_types: list[str]) -> list[ModelVersionRecord]:
+        """Atomically flip the active challenger to champion for a sport.
+
+        One transaction: the outgoing champions are retired (is_active=False,
+        role='shadow' -- the retired-champion marker) BEFORE the challenger
+        rows flip to role='champion', so the (sport, model_type, role)
+        partial unique index is satisfied at every step. The unified model
+        spans all its market rows (one shared artifact), so promotion flips
+        every market type together; promoting one market of a unified
+        version alone would serve two artifacts for one sport.
+
+        Raises ValueError when no active challenger rows exist.
+        """
+        async with self._engine.begin() as conn:
+            challenger_rows = (
+                await conn.execute(
+                    select(model_versions).where(
+                        model_versions.c.sport == sport,
+                        model_versions.c.model_type.in_(market_types),
+                        model_versions.c.role == "challenger",
+                        model_versions.c.is_active == True,  # noqa: E712
+                    )
+                )
+            ).fetchall()
+            if not challenger_rows:
+                raise ValueError(f"no active challenger to promote for {sport}")
+            await conn.execute(
+                update(model_versions)
+                .where(
+                    model_versions.c.sport == sport,
+                    model_versions.c.model_type.in_(market_types),
+                    model_versions.c.role == "champion",
+                    model_versions.c.is_active == True,  # noqa: E712
+                )
+                .values(is_active=False, role="shadow")
+            )
+            result = await conn.execute(
+                update(model_versions)
+                .where(model_versions.c.id.in_([row.id for row in challenger_rows]))
+                .values(role="champion")
+                .returning(model_versions)
+            )
+            return [_model_version_from_row(row) for row in result.fetchall()]
 
 
 class PredictionRepository:
@@ -187,18 +295,27 @@ class PredictionRepository:
         rows: list[dict[str, Any]],
         features: dict[str, Any],
         feature_sources: dict[str, Any],
+        row_features: list[dict[str, Any]] | None = None,
     ) -> list[PredictionRecord]:
-        """Insert predictions and their shared feature vector atomically."""
+        """Insert predictions and their feature vectors atomically.
+
+        row_features (Phase 7 Wave 4) carries each row's exact model input
+        vector, positionally parallel to rows; when omitted every row
+        stores the shared game-level ``features`` map (the pre-Wave-4
+        behavior).
+        """
+        if row_features is not None and len(row_features) != len(rows):
+            raise ValueError(f"row_features has {len(row_features)} entries for {len(rows)} rows")
         records: list[PredictionRecord] = []
         async with self._engine.begin() as conn:
-            for row in rows:
+            for i, row in enumerate(rows):
                 result = await conn.execute(insert(predictions).values(**row).returning(predictions))
                 record = _prediction_from_row(result.one())
                 records.append(record)
                 await conn.execute(
                     insert(feature_vectors).values(
                         prediction_id=record.id,
-                        features=features,
+                        features=row_features[i] if row_features is not None else features,
                         feature_sources=feature_sources,
                     )
                 )
@@ -228,6 +345,7 @@ class PredictionRepository:
         game_external_id: str,
         market_types: list[str] | None = None,
         model_version_id: uuid.UUID | None = None,
+        include_shadow: bool = False,
     ) -> list[PredictionRecord]:
         """Most recent prediction per (market type, side, prop identity) for a game.
 
@@ -238,11 +356,68 @@ class PredictionRepository:
         extend the key so distinct players/stats/lines each keep their
         latest row; they are NULL on game-market rows (DISTINCT ON treats
         NULLs as equal), leaving game-market behavior unchanged.
+
+        Shadow-scored challenger rows (Phase 7 Wave 4) are excluded by
+        default -- they share the primary rows' DISTINCT-ON key and are
+        written in the same batch, so without the filter a shadow row could
+        collapse over (and hide) the served prediction.
+        """
+        stmt = _latest_for_game_stmt(game_external_id, market_types, model_version_id, include_shadow)
+        async with self._engine.connect() as conn:
+            rows = (await conn.execute(stmt)).fetchall()
+        return [_prediction_from_row(row) for row in rows]
+
+    async def latest_rows_for_model(self, model_version_id: uuid.UUID) -> list[PredictionRecord]:
+        """Latest row per (game, side, prop identity) written by one model version.
+
+        Used by the experiments report (Phase 7 Wave 4): a challenger's
+        rows are shadow rows, so this intentionally does NOT filter
+        is_shadow -- filtering by model_version_id already isolates one
+        model's output.
         """
         stmt = (
             select(predictions)
-            .where(predictions.c.game_external_id == game_external_id)
+            .where(predictions.c.model_version_id == model_version_id)
             .order_by(
+                predictions.c.game_external_id,
+                predictions.c.side,
+                predictions.c.player_external_id,
+                predictions.c.stat_type,
+                predictions.c.prop_line,
+                predictions.c.created_at.desc(),
+            )
+            .distinct(
+                predictions.c.game_external_id,
+                predictions.c.side,
+                predictions.c.player_external_id,
+                predictions.c.stat_type,
+                predictions.c.prop_line,
+            )
+        )
+        async with self._engine.connect() as conn:
+            rows = (await conn.execute(stmt)).fetchall()
+        return [_prediction_from_row(row) for row in rows]
+
+    async def training_rows(
+        self, leagues: list[str], market_types: list[str]
+    ) -> list[tuple[PredictionRecord, dict[str, Any]]]:
+        """Latest primary row per (game, market, side, prop identity) with its stored feature vector.
+
+        Retraining assembly (Phase 7 Wave 4). Shadow rows are excluded: a
+        shadow row stores an identical copy of the primary row's feature
+        vector (they score the same features), so one row per key is both
+        deduplication and the complete feature history.
+        """
+        stmt = (
+            select(predictions, feature_vectors.c.features)
+            .join(feature_vectors, feature_vectors.c.prediction_id == predictions.c.id)
+            .where(
+                predictions.c.league.in_(leagues),
+                predictions.c.market_type.in_(market_types),
+                predictions.c.is_shadow == False,  # noqa: E712
+            )
+            .order_by(
+                predictions.c.game_external_id,
                 predictions.c.market_type,
                 predictions.c.side,
                 predictions.c.player_external_id,
@@ -251,6 +426,7 @@ class PredictionRepository:
                 predictions.c.created_at.desc(),
             )
             .distinct(
+                predictions.c.game_external_id,
                 predictions.c.market_type,
                 predictions.c.side,
                 predictions.c.player_external_id,
@@ -258,13 +434,9 @@ class PredictionRepository:
                 predictions.c.prop_line,
             )
         )
-        if market_types:
-            stmt = stmt.where(predictions.c.market_type.in_(market_types))
-        if model_version_id is not None:
-            stmt = stmt.where(predictions.c.model_version_id == model_version_id)
         async with self._engine.connect() as conn:
             rows = (await conn.execute(stmt)).fetchall()
-        return [_prediction_from_row(row) for row in rows]
+        return [(_prediction_from_row(row), dict(row.features)) for row in rows]
 
     async def is_healthy(self) -> bool:
         try:

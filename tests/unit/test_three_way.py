@@ -119,7 +119,11 @@ class FakeRegistry:
 
 class FakeRepo:
     async def insert_predictions(
-        self, rows: list[dict[str, Any]], features: dict[str, Any], feature_sources: dict[str, Any]
+        self,
+        rows: list[dict[str, Any]],
+        features: dict[str, Any],
+        feature_sources: dict[str, Any],
+        row_features: list[dict[str, Any]] | None = None,
     ) -> list[PredictionRecord]:
         return [
             PredictionRecord(

@@ -21,7 +21,9 @@ from prediction_engine.core.model.registry import ModelRegistry
 from prediction_engine.core.predictor import Predictor
 from prediction_engine.db.engine import create_engine
 from prediction_engine.db.repository import ModelVersionRepository, PredictionRepository
+from prediction_engine.services.experiments import ExperimentService
 from prediction_engine.services.health import HealthService
+from prediction_engine.services.retrain import RetrainService
 from prediction_engine.telemetry import configure_telemetry
 
 
@@ -58,8 +60,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             prediction_repo,
             redis_client,
             idempotency_ttl=settings.idempotency_ttl_seconds,
+            shadow_scoring_enabled=settings.shadow_scoring_enabled,
+            ab_split_pct=settings.ab_split_pct,
         )
         app.state.health_service = HealthService(statistics, lines, prediction_repo, registry, redis_client)
+        app.state.retrain_service = RetrainService(
+            model_repo,
+            prediction_repo,
+            statistics,
+            redis_client,
+            settings.model_dir,
+            status_ttl_seconds=settings.retrain_status_ttl_seconds,
+        )
+        app.state.experiment_service = ExperimentService(
+            model_repo,
+            prediction_repo,
+            statistics,
+            registry,
+            promotion_min_samples=settings.promotion_min_samples,
+        )
         try:
             yield
         finally:

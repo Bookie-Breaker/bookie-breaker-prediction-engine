@@ -4,6 +4,23 @@ Market line selection: the current best line from lines-service determines
 which spread/total line the prediction targets (selection strings use full
 team names, matching lines-service). When lines are unavailable the line
 nearest the simulation mean is used and implied probability is omitted.
+
+Shadow scoring (Phase 7 Wave 4): when an active challenger exists for a
+game market, every emitted row is scored a second time by the challenger
+and persisted as an is_shadow row under the challenger's
+model_version_id -- zero risk, since shadow rows are excluded from every
+read path and any shadow-path failure is logged without touching the
+primary rows. The optional deterministic traffic split (ab_split_pct > 0)
+serves the CHALLENGER as primary for sha256(game_id) buckets below the
+percentage (the champion becomes the shadow row): bankroll exposure to the
+challenger begins only when the operator raises that setting. Player-prop
+rows serve the champion only (challengers are game-market-only in v1).
+
+Feature vectors: each row persists its exact per-row vector (game features
+plus the per-market sim block). A shadow row's vector content is identical
+to its primary row's -- the models share features -- but the
+feature_vectors FK (unique prediction_id) requires one vector row per
+prediction row, so the content is duplicated rather than shared.
 """
 
 import hashlib
@@ -85,6 +102,8 @@ class Predictor:
         repo: PredictionRepository,
         redis_client: "aioredis.Redis",
         idempotency_ttl: int = 86_400,
+        shadow_scoring_enabled: bool = True,
+        ab_split_pct: int = 0,
     ) -> None:
         self._statistics = statistics
         self._lines = lines
@@ -95,6 +114,8 @@ class Predictor:
         self._repo = repo
         self._redis = redis_client
         self._idempotency_ttl = idempotency_ttl
+        self._shadow_scoring_enabled = shadow_scoring_enabled
+        self._ab_split_pct = ab_split_pct
 
     async def _best_lines_by_market(self, lines_game_id: str | None) -> dict[tuple[str, str], BestLine]:
         """Best line per (market type, side), when lines are available.
@@ -207,14 +228,18 @@ class Predictor:
             features[f"prop_is_{name}"] = 1.0 if name == stat_type else 0.0
         return features
 
-    async def _prop_rows(self, request: PredictionRequest, game: Game, model_key: str) -> list[dict[str, Any]]:
-        """PLAYER_PROP prediction-row dicts for the requested props (Wave 3).
+    async def _prop_rows(
+        self, request: PredictionRequest, game: Game, model_key: str
+    ) -> tuple[list[dict[str, Any]], list[FeatureMap]]:
+        """PLAYER_PROP prediction-row dicts (and their exact feature maps).
 
         The model only ever sees the OVER (or YES) perspective; UNDER and NO
         rows are emitted as renormalized complements of the calibrated
         probability, mirroring the two-way game-market logic. All
         contract violations (no player capture, unknown player/stat, a line
-        off the sim's half-step grid) surface as 422s.
+        off the sim's half-step grid) surface as 422s. The returned feature
+        maps parallel the rows (complement rows store the modeled
+        perspective's map, the vector the model actually saw).
         """
         try:
             loaded = await self._registry.get_active(model_key, PROP_MODEL_TYPE)
@@ -232,6 +257,7 @@ class Predictor:
         stat_names = get_prop_stats(model_key)
 
         rows: list[dict[str, Any]] = []
+        maps: list[FeatureMap] = []
         for prop in request.props:
             player = distributions.players.get(prop.player_external_id)
             if player is None:
@@ -280,6 +306,7 @@ class Predictor:
                             "prop_line": None,
                         }
                     )
+                    maps.append(features)
                 continue
 
             if prop.side in ("YES", "NO"):
@@ -317,6 +344,93 @@ class Predictor:
                         "prop_line": prop.line,
                     }
                 )
+                maps.append(features)
+        return rows, maps
+
+    def _serves_challenger(self, game_id: str) -> bool:
+        """Deterministic A/B bucket: sha256(game_id) % 100 under the split pct.
+
+        The same game always lands in the same bucket, so re-running
+        predictions never flips which model served it.
+        """
+        if self._ab_split_pct <= 0:
+            return False
+        bucket = int(hashlib.sha256(game_id.encode()).hexdigest(), 16) % 100
+        return bucket < self._ab_split_pct
+
+    def _row_feature_maps(
+        self, market: str, row_inputs: list[_RowInputs], bundle_features: FeatureMap, run: SimulationRun
+    ) -> list[FeatureMap]:
+        """The exact per-row model input vectors for one market's rows."""
+        maps: list[FeatureMap] = []
+        for inputs in row_inputs:
+            features: FeatureMap = dict(bundle_features)
+            features["sim_probability"] = inputs.sim_probability
+            features["sim_margin_mean"] = run.result.mean_margin
+            features["sim_total_mean"] = run.result.mean_total
+            features["sim_converged"] = 1.0 if run.converged else 0.0
+            features["market_is_spread"] = 1.0 if market == "SPREAD" else 0.0
+            features["market_is_total"] = 1.0 if market == "TOTAL" else 0.0
+            features["market_is_moneyline"] = 1.0 if market == "MONEYLINE" else 0.0
+            # Three-way features (ADR-027): ignored by sports whose
+            # registries do not include them (vectorization is
+            # registry-ordered), so two-way sports are unaffected.
+            features["sim_draw_probability"] = run.result.draw_probability
+            features["selection_is_draw"] = 1.0 if inputs.side == "DRAW" else 0.0
+            maps.append(features)
+        return maps
+
+    def _score_market(
+        self, loaded: LoadedModel, row_inputs: list[_RowInputs], feature_maps: list[FeatureMap]
+    ) -> list[tuple[float, dict[str, float]]]:
+        """Calibrated (probability, feature importance) per row for one model."""
+        calibrated: list[float] = []
+        importances: list[dict[str, float]] = []
+        for inputs, features in zip(row_inputs, feature_maps, strict=True):
+            adjustment = loaded.bundle.model.predict_adjustment(features)
+            raw = float(np.clip(inputs.sim_probability + adjustment, 0.01, 0.99))
+            calibrated.append(loaded.bundle.calibrator.apply(raw))
+            importances.append(loaded.bundle.model.feature_importance(features))
+        if len(calibrated) > 1:
+            # Independently calibrated three-way probabilities are
+            # renormalized to a proper distribution (ADR-027).
+            total = sum(calibrated)
+            calibrated = [value / total for value in calibrated]
+        return list(zip(calibrated, importances, strict=True))
+
+    def _market_rows(
+        self,
+        loaded: LoadedModel,
+        market: str,
+        row_inputs: list[_RowInputs],
+        scored: list[tuple[float, dict[str, float]]],
+        request: PredictionRequest,
+        game: Game,
+        is_shadow: bool,
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for inputs, (value, importance) in zip(row_inputs, scored, strict=True):
+            predicted = round(value, 5)
+            lower, upper = loaded.bundle.conformal.interval(predicted)
+            implied = inputs.implied_probability
+            rows.append(
+                {
+                    "game_external_id": request.game_id,
+                    "model_version_id": loaded.record.id,
+                    "league": game.league,
+                    "market_type": market,
+                    "side": inputs.side,
+                    "selection": inputs.selection,
+                    "predicted_probability": predicted,
+                    "simulation_probability": round(inputs.sim_probability, 5),
+                    "implied_probability": round(implied, 5) if implied is not None else None,
+                    "edge": round(predicted - implied, 5) if implied is not None else None,
+                    "confidence_lower": lower,
+                    "confidence_upper": upper,
+                    "feature_importance": importance,
+                    "is_shadow": is_shadow,
+                }
+            )
         return rows
 
     async def create_predictions(
@@ -352,6 +466,8 @@ class Predictor:
         best_lines = await self._best_lines_by_market(bundle.lines_game_external_id)
 
         rows: list[dict[str, Any]] = []
+        row_feature_maps: list[FeatureMap] = []
+        serve_challenger_bucket = self._serves_challenger(request.game_id)
         for market in request.market_types:
             try:
                 loaded = await self._registry.get_active(model_key, market)
@@ -360,67 +476,59 @@ class Predictor:
             if loaded is None:
                 raise UnprocessableError(f"No active model for {model_key} {market}")
 
-            calibrated: list[float] = []
-            importances: list[dict[str, float]] = []
+            challenger: LoadedModel | None = None
+            if self._shadow_scoring_enabled or self._ab_split_pct > 0:
+                try:
+                    challenger = await self._registry.get_challenger(model_key, market)
+                except Exception:  # noqa: BLE001 - the challenger path never breaks serving
+                    logger.warning(
+                        "challenger lookup failed for %s %s; serving champion only",
+                        model_key,
+                        market,
+                        exc_info=True,
+                    )
+            primary, shadow = loaded, challenger
+            if challenger is not None and serve_challenger_bucket:
+                primary, shadow = challenger, loaded
+            if not self._shadow_scoring_enabled:
+                shadow = None
+
             row_inputs = self._market_inputs(market, run, game, best_lines, three_way_moneyline)
-            for inputs in row_inputs:
-                features: FeatureMap = dict(bundle.features)
-                features["sim_probability"] = inputs.sim_probability
-                features["sim_margin_mean"] = run.result.mean_margin
-                features["sim_total_mean"] = run.result.mean_total
-                features["sim_converged"] = 1.0 if run.converged else 0.0
-                features["market_is_spread"] = 1.0 if market == "SPREAD" else 0.0
-                features["market_is_total"] = 1.0 if market == "TOTAL" else 0.0
-                features["market_is_moneyline"] = 1.0 if market == "MONEYLINE" else 0.0
-                # Three-way features (ADR-027): ignored by sports whose
-                # registries do not include them (vectorization is
-                # registry-ordered), so two-way sports are unaffected.
-                features["sim_draw_probability"] = run.result.draw_probability
-                features["selection_is_draw"] = 1.0 if inputs.side == "DRAW" else 0.0
-
-                adjustment = loaded.bundle.model.predict_adjustment(features)
-                raw = float(np.clip(inputs.sim_probability + adjustment, 0.01, 0.99))
-                calibrated.append(loaded.bundle.calibrator.apply(raw))
-                importances.append(loaded.bundle.model.feature_importance(features))
-
-            if len(calibrated) > 1:
-                # Independently calibrated three-way probabilities are
-                # renormalized to a proper distribution (ADR-027).
-                total = sum(calibrated)
-                calibrated = [value / total for value in calibrated]
-
-            for inputs, value, importance in zip(row_inputs, calibrated, importances, strict=True):
-                predicted = round(value, 5)
-                lower, upper = loaded.bundle.conformal.interval(predicted)
-                implied = inputs.implied_probability
-                rows.append(
-                    {
-                        "game_external_id": request.game_id,
-                        "model_version_id": loaded.record.id,
-                        "league": game.league,
-                        "market_type": market,
-                        "side": inputs.side,
-                        "selection": inputs.selection,
-                        "predicted_probability": predicted,
-                        "simulation_probability": round(inputs.sim_probability, 5),
-                        "implied_probability": round(implied, 5) if implied is not None else None,
-                        "edge": round(predicted - implied, 5) if implied is not None else None,
-                        "confidence_lower": lower,
-                        "confidence_upper": upper,
-                        "feature_importance": importance,
-                    }
-                )
+            feature_maps = self._row_feature_maps(market, row_inputs, bundle.features, run)
+            scored = self._score_market(primary, row_inputs, feature_maps)
+            rows.extend(self._market_rows(primary, market, row_inputs, scored, request, game, is_shadow=False))
+            row_feature_maps.extend(feature_maps)
+            if shadow is not None:
+                try:
+                    shadow_scored = self._score_market(shadow, row_inputs, feature_maps)
+                except Exception:  # noqa: BLE001 - shadow failures never break the primary path
+                    logger.warning(
+                        "shadow scoring failed for %s %s (model %s); primary rows unaffected",
+                        model_key,
+                        market,
+                        shadow.record.id,
+                        exc_info=True,
+                    )
+                else:
+                    rows.extend(
+                        self._market_rows(shadow, market, row_inputs, shadow_scored, request, game, is_shadow=True)
+                    )
+                    row_feature_maps.extend(feature_maps)
 
         if request.props:
-            rows.extend(await self._prop_rows(request, game, model_key))
+            prop_rows, prop_maps = await self._prop_rows(request, game, model_key)
+            rows.extend(prop_rows)
+            row_feature_maps.extend(prop_maps)
 
         records = await self._repo.insert_predictions(
             rows,
             features={k: v for k, v in bundle.features.items()},
             feature_sources=dict(bundle.sources),
+            row_features=[dict(feature_map) for feature_map in row_feature_maps],
         )
+        primary_records = [record for record in records if not record.is_shadow]
 
-        edges_found = sum(1 for r in records if r.edge is not None and r.edge > 0)
+        edges_found = sum(1 for r in primary_records if r.edge is not None and r.edge > 0)
         event_markets = list(request.market_types) + ([PROP_MODEL_TYPE] if request.props else [])
         await publish_prediction_completed(
             self._redis,
@@ -428,14 +536,16 @@ class Predictor:
             game_ids=[request.game_id],
             league=game.league,
             market_types=event_markets,
-            predictions_count=len(records),
+            predictions_count=len(primary_records),
             edges_found=edges_found,
         )
 
+        # Shadow rows are persisted for experiment evaluation but excluded
+        # from the response: consumers act on what this call serves.
         response = PredictionGroupData(
             game_id=request.game_id,
             simulation_run_id=request.simulation_run_id,
-            predictions=[_to_item(record) for record in records],
+            predictions=[_to_item(record) for record in primary_records],
             features_used=dict(bundle.features),
             feature_source_versions=dict(bundle.sources),
         )

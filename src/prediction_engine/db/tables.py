@@ -64,11 +64,19 @@ model_versions = Table(
     Column("is_active", Boolean, nullable=False, server_default=text("FALSE")),
     Column("artifact_path", Text, nullable=False),
     Column("notes", Text),
+    # Serving role (Phase 7 Wave 4): champion is the default serve path,
+    # challenger is shadow-scored, shadow marks retired ex-champions.
+    Column("role", Text, nullable=False, server_default=text("'champion'")),
     Column("created_at", TIMESTAMP(timezone=True), nullable=False, server_default=text("NOW()")),
+    CheckConstraint(
+        "role IN ('champion', 'challenger', 'shadow')",
+        name="chk_model_versions_role",
+    ),
     Index(
         "uq_model_versions_active",
         "sport",
         "model_type",
+        "role",
         unique=True,
         postgresql_where=text("is_active = TRUE"),
     ),
@@ -98,6 +106,9 @@ predictions = Table(
     Column("confidence_lower", Numeric(6, 5)),
     Column("confidence_upper", Numeric(6, 5)),
     Column("feature_importance", JSONB, nullable=False, server_default=text("'{}'")),
+    # Shadow-scored challenger rows (Phase 7 Wave 4); every read path
+    # (latest, edges) filters is_shadow = FALSE.
+    Column("is_shadow", Boolean, nullable=False, server_default=text("FALSE")),
     Column("created_at", TIMESTAMP(timezone=True), nullable=False, server_default=text("NOW()")),
     CheckConstraint(
         "predicted_probability >= 0 AND predicted_probability <= 1",

@@ -191,7 +191,11 @@ class FakeRepo:
         self.persisted_features: dict[str, Any] | None = None
 
     async def insert_predictions(
-        self, rows: list[dict[str, Any]], features: dict[str, Any], feature_sources: dict[str, Any]
+        self,
+        rows: list[dict[str, Any]],
+        features: dict[str, Any],
+        feature_sources: dict[str, Any],
+        row_features: list[dict[str, Any]] | None = None,
     ) -> list[PredictionRecord]:
         self.persisted_features = features
         return [

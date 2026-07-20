@@ -21,6 +21,12 @@ from prediction_engine.core.calibration import PlattCalibrator
 from prediction_engine.core.conformal import SplitConformal
 from prediction_engine.core.features.registry import get_features, get_prop_features
 from prediction_engine.core.model.artifact import ArtifactBundle
+from prediction_engine.core.model.ensemble import (
+    RF_NUM_BOOST_ROUND,
+    RF_XGB_PARAMS,
+    EnsembleAdjustmentModel,
+    fit_blend_weights,
+)
 from prediction_engine.core.model.xgb import AdjustmentModel
 from prediction_engine.core.training.dataset import TrainingSet
 from prediction_engine.core.training.evaluate import brier_score, expected_calibration_error, log_loss
@@ -64,6 +70,7 @@ def train_model(
     data_label: str = "synthetic",
     sport: str = "BASKETBALL",
     market: str = "GAME",
+    ensemble: bool = False,
 ) -> TrainingResult:
     """Train the adjustment model for a sport.
 
@@ -71,6 +78,12 @@ def train_model(
     SPREAD/TOTAL/MONEYLINE model) or "PLAYER_PROP" (the unified prop model,
     Phase 7 Wave 3), which uses the prop feature registry and saves under
     the "props" artifact family.
+
+    ensemble=True (Phase 7 Wave 4) additionally trains an XGBoost
+    random-forest member on the same walk-forward split, fits simplex blend
+    weights on the calibration split by minimizing Brier, and then fits
+    Platt + conformal on the BLENDED output, so calibration and intervals
+    describe the model that actually serves.
     """
     is_prop = market == "PLAYER_PROP"
     feature_names = list(get_prop_features(sport)) if is_prop else list(get_features(sport))
@@ -110,18 +123,32 @@ def train_model(
         early_stopping_rounds=25,
         verbose_eval=False,
     )
-    model = AdjustmentModel(booster, feature_names)
+
+    boosters: list[xgb.Booster] = [booster]
+    weights: list[float] = [1.0]
+    model: AdjustmentModel | EnsembleAdjustmentModel = AdjustmentModel(booster, feature_names)
+    if ensemble:
+        rf_booster = xgb.train(RF_XGB_PARAMS, dtrain, num_boost_round=RF_NUM_BOOST_ROUND)
+        member_probs = [
+            np.asarray(np.clip(calibration_set.sim_probs + b.predict(dcalib), 0.01, 0.99), dtype=np.float64)
+            for b in (booster, rf_booster)
+        ]
+        weights = fit_blend_weights(member_probs, calibration_set.outcomes)
+        boosters = [booster, rf_booster]
+        model = EnsembleAdjustmentModel([AdjustmentModel(b, feature_names) for b in boosters], weights)
+
+    def predict_adjustments(subset: TrainingSet) -> np.ndarray:
+        matrix = xgb.DMatrix(subset.matrix(feature_names), feature_names=feature_names, missing=np.nan)
+        stacked = np.vstack([b.predict(matrix) for b in boosters])
+        return np.asarray(np.asarray(weights) @ stacked, dtype=np.float64)
 
     def raw_probs(subset: TrainingSet) -> np.ndarray:
-        matrix = xgb.DMatrix(subset.matrix(feature_names), feature_names=feature_names, missing=np.nan)
-        adjustments = booster.predict(matrix)
-        return np.asarray(np.clip(subset.sim_probs + adjustments, 0.01, 0.99), dtype=np.float64)
+        return np.asarray(np.clip(subset.sim_probs + predict_adjustments(subset), 0.01, 0.99), dtype=np.float64)
 
     calibrator = PlattCalibrator.fit(raw_probs(calibration_set), calibration_set.outcomes)
 
     conformal_probs = raw_probs(conformal_set)
-    conformal_matrix = xgb.DMatrix(conformal_set.matrix(feature_names), feature_names=feature_names, missing=np.nan)
-    adjustment_residuals = conformal_set.targets - booster.predict(conformal_matrix)
+    adjustment_residuals = conformal_set.targets - predict_adjustments(conformal_set)
     conformal = SplitConformal.fit(np.asarray(adjustment_residuals, dtype=np.float64))
 
     calibrated = np.array([calibrator.apply(float(p)) for p in conformal_probs])
@@ -152,6 +179,12 @@ def train_model(
         "calibration": "platt",
         "conformal_alpha": 0.1,
     }
+    if ensemble:
+        metadata["ensemble"] = {
+            "members": ["gbt", "rf"],
+            "weights": weights,
+            "rf_hyperparameters": {**RF_XGB_PARAMS, "num_boost_round": RF_NUM_BOOST_ROUND},
+        }
 
     bundle = ArtifactBundle(model=model, calibrator=calibrator, conformal=conformal, metadata=metadata)
     return TrainingResult(bundle=bundle, metrics=metrics, training_samples=len(train_set))
