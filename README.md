@@ -1,5 +1,14 @@
 # bookie-breaker-prediction-engine
 
+[![CI](https://img.shields.io/github/actions/workflow/status/Bookie-Breaker/bookie-breaker-prediction-engine/ci.yml?branch=main&label=CI&logo=githubactions&logoColor=white)](https://github.com/Bookie-Breaker/bookie-breaker-prediction-engine/actions/workflows/ci.yml)
+[![coverage](https://img.shields.io/codecov/c/github/Bookie-Breaker/bookie-breaker-prediction-engine?logo=codecov&logoColor=white)](https://app.codecov.io/gh/Bookie-Breaker/bookie-breaker-prediction-engine)
+![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi&logoColor=white)
+![uv](https://img.shields.io/badge/uv-managed-DE5FE9?logo=uv&logoColor=white)
+![XGBoost](https://img.shields.io/badge/XGBoost-2.1-EB0028)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-4169E1?logo=postgresql&logoColor=white)
+![Redis](https://img.shields.io/badge/Redis-7-DC382D?logo=redis&logoColor=white)
+
 ML calibration layer (port 8004) that turns simulation distributions plus contextual features
 (injuries, rest, weather, line movement) into calibrated probabilities with confidence
 intervals, using XGBoost. Serves champion models per league/market with optional ensembles.
