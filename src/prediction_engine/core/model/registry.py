@@ -12,6 +12,13 @@ either it trains the synthetic bootstrap in-process (seconds; see
 core/training/synthetic.py). Basketball artifacts have lived at
 models/basketball/unified/ since Phase 2 — the per-sport path scheme is
 identical for them, so no legacy-path check is needed.
+
+Player props (Phase 7 Wave 3): each sport's unified prop model covers all
+of its prop stats (stat type is a feature) and registers as a single
+model_versions row with model_type PLAYER_PROP, keyed (sport,
+"PLAYER_PROP") in the active map. Prop artifacts live under
+models/{sport}/props/ and bootstrap lazily on the first prop request
+(ensure_prop_bootstrap), not at startup.
 """
 
 import asyncio
@@ -26,6 +33,8 @@ from prediction_engine.db.repository import ModelVersionRecord, ModelVersionRepo
 logger = logging.getLogger(__name__)
 
 MARKET_TYPES = ["SPREAD", "TOTAL", "MONEYLINE"]
+
+PROP_MODEL_TYPE = "PLAYER_PROP"
 
 
 @dataclass
@@ -59,6 +68,12 @@ class ModelRegistry:
         return ok
 
     async def get_active(self, sport: str, market_type: str) -> LoadedModel | None:
+        if market_type == PROP_MODEL_TYPE:
+            if (sport, PROP_MODEL_TYPE) not in self._active:
+                async with self._bootstrap_lock:
+                    if (sport, PROP_MODEL_TYPE) not in self._active:
+                        await self.ensure_prop_bootstrap(sport)
+            return self._active.get((sport, PROP_MODEL_TYPE))
         if not self._has_sport(sport):
             async with self._bootstrap_lock:
                 if not self._has_sport(sport):
@@ -66,10 +81,14 @@ class ModelRegistry:
         return self._active.get((sport, market_type))
 
     def _has_sport(self, sport: str) -> bool:
-        return any(key[0] == sport for key in self._active)
+        """Whether the sport's game-market models are loaded (props are keyed separately)."""
+        return any(key[0] == sport and key[1] in MARKET_TYPES for key in self._active)
 
     async def ensure_bootstrap(self, sport: str) -> None:
-        active = await self._repo.list_models(sport=sport, is_active=True)
+        # Prop rows share the sport but bootstrap separately, so the game
+        # bootstrap only counts game-market model_versions rows.
+        all_active = await self._repo.list_models(sport=sport, is_active=True)
+        active = [record for record in all_active if record.model_type in MARKET_TYPES]
         if not active:
             artifact_dir = find_latest_artifact(self._model_dir, sport.lower())
             if artifact_dir is None:
@@ -94,12 +113,45 @@ class ModelRegistry:
             logger.info("registered bootstrap model %s for %s markets", bundle.version_tag, len(active))
         await self._load_active(active)
 
-    def _train_bootstrap(self, sport: str) -> Path:
-        from prediction_engine.core.training.synthetic import get_synthetic_generator
+    async def ensure_prop_bootstrap(self, sport: str) -> None:
+        """Bootstrap the sport's unified player-prop model (Phase 7 Wave 3).
+
+        Mirrors ensure_bootstrap: register the newest on-disk props
+        artifact, training the synthetic prop bootstrap in-process when no
+        artifact exists either. Raises ValueError (via the prop registries)
+        for sports without a prop wave yet.
+        """
+        active = await self._repo.list_models(sport=sport, market_type=PROP_MODEL_TYPE, is_active=True)
+        if not active:
+            artifact_dir = find_latest_artifact(self._model_dir, sport.lower(), family="props")
+            if artifact_dir is None:
+                logger.warning(
+                    "no %s prop model artifact found under %s; training synthetic bootstrap", sport, self._model_dir
+                )
+                artifact_dir = self._train_bootstrap(sport, market=PROP_MODEL_TYPE)
+            bundle = ArtifactBundle.load(artifact_dir)
+            trained_at = datetime.fromisoformat(str(bundle.metadata["trained_at"]))
+            active = await self._repo.register(
+                sport=sport,
+                market_types=[PROP_MODEL_TYPE],
+                version=bundle.version_tag,
+                trained_at=trained_at,
+                training_range=(trained_at - timedelta(days=365 * 4), trained_at),
+                training_samples=int(bundle.metadata.get("training_samples", 0)),
+                evaluation_metrics=dict(bundle.metadata.get("metrics", {})),
+                feature_names=bundle.feature_names,
+                artifact_path=str(artifact_dir),
+                notes=f"prop bootstrap ({bundle.metadata.get('data_label', 'unknown')} data)",
+            )
+            logger.info("registered bootstrap prop model %s for %s", bundle.version_tag, sport)
+        await self._load_active(active)
+
+    def _train_bootstrap(self, sport: str, market: str = "GAME") -> Path:
+        from prediction_engine.core.training.synthetic import get_prop_synthetic_generator, get_synthetic_generator
         from prediction_engine.core.training.train import save_artifact, train_model
 
-        dataset = get_synthetic_generator(sport)()
-        result = train_model(dataset, n_rounds=100, data_label="synthetic", sport=sport)
+        generator = get_prop_synthetic_generator(sport) if market == PROP_MODEL_TYPE else get_synthetic_generator(sport)
+        result = train_model(generator(), n_rounds=100, data_label="synthetic", sport=sport, market=market)
         return save_artifact(result, self._model_dir)
 
     async def _load_active(self, records: list[ModelVersionRecord]) -> None:

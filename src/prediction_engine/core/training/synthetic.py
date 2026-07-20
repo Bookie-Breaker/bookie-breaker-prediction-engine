@@ -18,17 +18,23 @@ Embedded true effects the model can learn:
 """
 
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import numpy as np
 
 from prediction_engine.core.features.registry import (
     BASEBALL_FEATURES,
+    BASEBALL_PROP_STATS,
+    BASKETBALL_PROP_STATS,
     FOOTBALL_FEATURES,
+    FOOTBALL_PROP_STATS,
     HOCKEY_FEATURES,
     NBA_FEATURES,
     NCAA_BB_FEATURES,
     SOCCER_FEATURES,
+    SOCCER_PROP_STATS,
     FeatureMap,
+    get_prop_features,
 )
 from prediction_engine.core.training.dataset import TrainingSet
 
@@ -993,6 +999,213 @@ def generate_ncaa_bb_synthetic_dataset(n_rows: int = 6_000, seed: int = 23, n_se
         features.append(row)
 
     return TrainingSet(features=features, sim_probs=sim_probs, outcomes=outcomes, seasons=seasons)
+
+
+# --- Player-prop synthetic generators (Phase 7 Wave 3) -----------------------
+#
+# One unified prop bootstrap per sport following the established pattern:
+# a latent per-player rate the "simulation" only sees a dampened, noisy,
+# per-stat-biased view of, actual stat outcomes sampled from the true rate
+# (Gamma-Poisson overdispersed for counts, Normal for yardage), and rows
+# built as the OVER (or YES) perspective against varied half-step lines --
+# the only perspective the predictor ever feeds the model (UNDER/NO are
+# complements). The learnable correction signals are the dampening (via
+# sim_prop_probability), the per-stat systematic bias (via the stat
+# one-hots), and tail miscalibration of the Poisson-shaped sim view against
+# the overdispersed truth (via prop_line vs sim_stat_mean/std geometry).
+# A hidden matchup effect the features cannot recover keeps conformal
+# widths honest.
+PROP_SIM_DAMPENING = 0.65  # the prop "simulation" underreacts too
+PROP_SIM_NOISE = 0.10  # logit-scale noise on simulated prop probabilities
+PROP_MATCHUP_STD = 0.15  # hidden per-game matchup effect (log/logit scale)
+PROP_DISPERSION = 8.0  # Gamma shape for count overdispersion (NegBinomial)
+_PROP_MAX_COUNT = 40  # Poisson grid truncation for count-stat over grids
+
+
+@dataclass(frozen=True)
+class _PropStatSpec:
+    """One prop stat's generative parameters.
+
+    kind: "count" (Poisson-shaped, over/under a half-step line), "normal"
+    (yardage-style, over/under), or "yes_no" (Bernoulli, no line).
+    mean is the league-average rate (or yes-probability); skill_std the
+    latent player spread (log scale for count, additive for normal, logit
+    for yes_no); game_std the per-game noise (normal kind only); sim_bias a
+    per-stat systematic logit bias in the sim's view the one-hots let the
+    model learn away.
+    """
+
+    stat: str
+    kind: str
+    mean: float
+    skill_std: float
+    game_std: float = 0.0
+    sim_bias: float = 0.0
+
+
+_SOCCER_PROP_SPECS: tuple[_PropStatSpec, ...] = (
+    _PropStatSpec("player_goal_scorer_anytime", "yes_no", 0.25, 0.80, sim_bias=0.15),
+    _PropStatSpec("player_shots", "count", 2.2, 0.35, sim_bias=-0.10),
+    _PropStatSpec("player_shots_on_target", "count", 0.9, 0.35),
+)
+_BASKETBALL_PROP_SPECS: tuple[_PropStatSpec, ...] = (
+    _PropStatSpec("player_points", "count", 15.0, 0.45, sim_bias=0.08),
+    _PropStatSpec("player_rebounds", "count", 6.0, 0.50),
+    _PropStatSpec("player_assists", "count", 4.5, 0.60, sim_bias=-0.08),
+    _PropStatSpec("player_threes", "count", 1.8, 0.50, sim_bias=0.12),
+    _PropStatSpec("player_points_rebounds_assists", "count", 25.0, 0.40),
+)
+_BASEBALL_PROP_SPECS: tuple[_PropStatSpec, ...] = (
+    _PropStatSpec("batter_hits", "count", 1.0, 0.30),
+    _PropStatSpec("batter_total_bases", "count", 1.5, 0.35, sim_bias=0.08),
+    _PropStatSpec("batter_home_runs", "count", 0.14, 0.50, sim_bias=0.12),
+    _PropStatSpec("pitcher_strikeouts", "count", 5.5, 0.35, sim_bias=-0.08),
+)
+_FOOTBALL_PROP_SPECS: tuple[_PropStatSpec, ...] = (
+    _PropStatSpec("player_pass_yds", "normal", 230.0, 35.0, game_std=55.0, sim_bias=0.08),
+    _PropStatSpec("player_rush_yds", "normal", 55.0, 25.0, game_std=28.0),
+    _PropStatSpec("player_reception_yds", "normal", 45.0, 20.0, game_std=25.0, sim_bias=-0.08),
+    _PropStatSpec("player_receptions", "count", 3.8, 0.35),
+    _PropStatSpec("player_anytime_td", "yes_no", 0.35, 0.70, sim_bias=0.12),
+)
+
+
+def _prop_sim_view(true_prob: float, bias: float, rng: np.random.Generator) -> float:
+    """The prop "simulation" view: dampened logit response, per-stat bias, noise."""
+    logit = float(np.log(true_prob / (1.0 - true_prob)))
+    noisy = PROP_SIM_DAMPENING * logit + bias + float(rng.normal(0.0, PROP_SIM_NOISE))
+    return float(np.clip(1.0 / (1.0 + np.exp(-noisy)), 0.02, 0.98))
+
+
+def _poisson_over_probability(rate: float, line: float) -> float:
+    """P(Poisson(rate) > line) for a half-step line."""
+    pmf = _poisson_pmf(np.array([rate]), _PROP_MAX_COUNT)[0]
+    return float(pmf[int(np.floor(line)) + 1 :].sum())
+
+
+def _generate_prop_dataset(
+    sport: str,
+    specs: tuple[_PropStatSpec, ...],
+    n_rows: int,
+    seed: int,
+    n_seasons: int,
+) -> TrainingSet:
+    """Shared prop-row machinery; per-sport wrappers own the spec tables."""
+    rng = np.random.default_rng(seed)
+    prop_features = get_prop_features(sport)
+    stat_names = [spec.stat for spec in specs]
+
+    features: list[FeatureMap] = []
+    sim_probs: list[float] = []
+    outcomes: list[float] = []
+    seasons = (np.arange(n_rows) * n_seasons // n_rows).astype(np.int64)
+
+    for _ in range(n_rows):
+        spec = specs[int(rng.integers(0, len(specs)))]
+        matchup = float(rng.normal(0.0, PROP_MATCHUP_STD))  # hidden from the sim AND the features
+
+        if spec.kind == "yes_no":
+            skill = float(rng.normal(0.0, spec.skill_std))
+            base_logit = float(np.log(spec.mean / (1.0 - spec.mean)))
+            known_prob = float(1.0 / (1.0 + np.exp(-(base_logit + skill))))
+            true_prob = float(1.0 / (1.0 + np.exp(-(base_logit + skill + matchup))))
+            sim_prob = _prop_sim_view(known_prob, spec.sim_bias, rng)
+            outcome = 1.0 if rng.random() < true_prob else 0.0
+            line = 0.0
+            sim_mean = float(np.clip(known_prob + rng.normal(0.0, 0.01), 0.01, 0.99))
+            sim_std = float(np.sqrt(sim_mean * (1.0 - sim_mean)))
+            is_yes = True
+        elif spec.kind == "count":
+            rate = spec.mean * float(np.exp(rng.normal(0.0, spec.skill_std)))
+            true_rate = rate * float(np.exp(matchup))
+            line = max(0.5, float(np.floor(rate + rng.uniform(-1.0, 1.0) * max(0.6, 0.5 * np.sqrt(rate)))) + 0.5)
+            base_over = float(np.clip(_poisson_over_probability(rate, line), 0.02, 0.98))
+            sim_prob = _prop_sim_view(base_over, spec.sim_bias, rng)
+            # Overdispersed actual (Gamma-Poisson = NegBinomial): real player
+            # stats have heavier tails than the sim's Poisson view assumes.
+            dispersed_rate = true_rate * float(rng.gamma(PROP_DISPERSION, 1.0 / PROP_DISPERSION))
+            outcome = 1.0 if float(rng.poisson(dispersed_rate)) > line else 0.0
+            sim_mean = float(rate * (1.0 + rng.normal(0.0, 0.02)))
+            sim_std = float(np.sqrt(rate))
+            is_yes = False
+        else:  # "normal" (yardage)
+            rate = spec.mean + float(rng.normal(0.0, spec.skill_std))
+            true_mean = rate + matchup * spec.mean  # matchup scales with the stat's magnitude
+            line = float(np.floor(rate + rng.uniform(-0.6, 0.6) * spec.game_std)) + 0.5
+            base_over = float(np.clip(1.0 - _phi(np.array([(line - rate) / spec.game_std]))[0], 0.02, 0.98))
+            sim_prob = _prop_sim_view(base_over, spec.sim_bias, rng)
+            actual = max(0.0, float(rng.normal(true_mean, spec.game_std)))
+            outcome = 1.0 if actual > line else 0.0
+            sim_mean = float(rate + rng.normal(0.0, 0.02 * spec.mean))
+            sim_std = float(spec.game_std * (1.0 + rng.normal(0.0, 0.02)))
+            is_yes = False
+
+        row: FeatureMap = dict.fromkeys(prop_features, None)
+        row.update(
+            {
+                "sim_prop_probability": sim_prob,
+                "prop_line": line,
+                "sim_stat_mean": sim_mean,
+                "sim_stat_std": sim_std,
+                "side_is_over": 0.0 if is_yes else 1.0,
+                "side_is_yes": 1.0 if is_yes else 0.0,
+            }
+        )
+        for name in stat_names:
+            row[f"prop_is_{name}"] = 1.0 if name == spec.stat else 0.0
+        features.append(row)
+        sim_probs.append(sim_prob)
+        outcomes.append(outcome)
+
+    return TrainingSet(
+        features=features,
+        sim_probs=np.array(sim_probs, dtype=np.float64),
+        outcomes=np.array(outcomes, dtype=np.float64),
+        seasons=seasons,
+    )
+
+
+def generate_soccer_prop_dataset(n_rows: int = 6_000, seed: int = 29, n_seasons: int = 4) -> TrainingSet:
+    """Soccer prop bootstrap rows (anytime scorer yes/no, shots, shots on target)."""
+    assert [spec.stat for spec in _SOCCER_PROP_SPECS] == list(SOCCER_PROP_STATS)
+    return _generate_prop_dataset("SOCCER", _SOCCER_PROP_SPECS, n_rows, seed, n_seasons)
+
+
+def generate_basketball_prop_dataset(n_rows: int = 6_000, seed: int = 31, n_seasons: int = 4) -> TrainingSet:
+    """Basketball prop bootstrap rows (points/rebounds/assists/threes/PRA)."""
+    assert [spec.stat for spec in _BASKETBALL_PROP_SPECS] == list(BASKETBALL_PROP_STATS)
+    return _generate_prop_dataset("BASKETBALL", _BASKETBALL_PROP_SPECS, n_rows, seed, n_seasons)
+
+
+def generate_baseball_prop_dataset(n_rows: int = 6_000, seed: int = 37, n_seasons: int = 4) -> TrainingSet:
+    """Baseball prop bootstrap rows (dormant this wave; bootstrap-only-synthetic)."""
+    assert [spec.stat for spec in _BASEBALL_PROP_SPECS] == list(BASEBALL_PROP_STATS)
+    return _generate_prop_dataset("BASEBALL", _BASEBALL_PROP_SPECS, n_rows, seed, n_seasons)
+
+
+def generate_football_prop_dataset(n_rows: int = 6_000, seed: int = 41, n_seasons: int = 4) -> TrainingSet:
+    """Football prop bootstrap rows (dormant this wave; bootstrap-only-synthetic)."""
+    assert [spec.stat for spec in _FOOTBALL_PROP_SPECS] == list(FOOTBALL_PROP_STATS)
+    return _generate_prop_dataset("FOOTBALL", _FOOTBALL_PROP_SPECS, n_rows, seed, n_seasons)
+
+
+# Sport -> player-prop synthetic bootstrap generator (Phase 7 Wave 3).
+# SOCCER and BASKETBALL are live in v1; BASEBALL and FOOTBALL are
+# registered but dormant (no live prop line coverage yet).
+PROP_SYNTHETIC_GENERATORS: dict[str, Callable[[], TrainingSet]] = {
+    "SOCCER": generate_soccer_prop_dataset,
+    "BASKETBALL": generate_basketball_prop_dataset,
+    "BASEBALL": generate_baseball_prop_dataset,
+    "FOOTBALL": generate_football_prop_dataset,
+}
+
+
+def get_prop_synthetic_generator(sport: str) -> Callable[[], TrainingSet]:
+    """Return the player-prop synthetic dataset generator for a sport."""
+    try:
+        return PROP_SYNTHETIC_GENERATORS[sport]
+    except KeyError:
+        raise ValueError(f"no player-prop synthetic generator registered for {sport}; added in its prop wave") from None
 
 
 # Model key -> synthetic bootstrap generator. Each league wave registers

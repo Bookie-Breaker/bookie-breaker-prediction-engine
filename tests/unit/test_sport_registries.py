@@ -252,8 +252,14 @@ class TestModelRegistry:
             assert loaded is not None
             assert loaded.record.sport == "BASKETBALL"
             assert loaded.record.model_type == market
-        assert await registry.get_active("BASKETBALL", "PLAYER_PROP") is None
+        # game-market markets the sport never registers stay None
+        assert await registry.get_active("BASKETBALL", "FUTURE") is None
         assert set(registry.active_map()) == {"BASKETBALL_SPREAD", "BASKETBALL_TOTAL", "BASKETBALL_MONEYLINE"}
+        # PLAYER_PROP is keyed separately and bootstraps lazily (Wave 3)
+        prop_loaded = await registry.get_active("BASKETBALL", "PLAYER_PROP")
+        assert prop_loaded is not None
+        assert prop_loaded.record.model_type == "PLAYER_PROP"
+        assert "BASKETBALL_PLAYER_PROP" in registry.active_map()
 
     async def test_soccer_bootstrap_registers_all_markets(self, model_dir) -> None:
         registry = ModelRegistry(FakeModelVersionRepo(), model_dir)  # type: ignore[arg-type]
